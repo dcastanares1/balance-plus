@@ -66,7 +66,7 @@ function daysUntil(d: Date): number {
   return Math.max(0, Math.ceil((target.getTime() - today.getTime()) / 86400000));
 }
 
-type ViewId = "dashboard" | "upcoming" | "goals";
+type ViewId = "dashboard" | "upcoming" | "goals" | "familyFinancing";
 
 const HOURLY_RATE_STORAGE_KEY = "balance-plus-hourly-rate";
 const DEFAULT_HOURLY_RATE = 33.5;
@@ -140,6 +140,104 @@ interface SavingsContribution {
   source: "manual" | "retention";
   createdAt: string;
   movementId?: number | null;
+}
+
+type FamilyFinancingStatus = "in_progress" | "completed";
+
+interface FamilyFinancingItem {
+  id: string;
+  name: string;
+  totalAmount: number;
+  purchaseDate: string;
+  notes: string | null;
+  installmentCount: number;
+  status: FamilyFinancingStatus;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+interface FamilyFinancingInstallment {
+  id: string;
+  itemId: string;
+  installmentNumber: number;
+  amount: number;
+  dueDate: string;
+  isPaid: boolean;
+  paidAt: string | null;
+  createdAt: string;
+}
+
+function getDueDateForInstallment(purchaseDate: string, installmentNumber: number): string {
+  const [year, month] = purchaseDate.split("-").map(Number);
+  const due = new Date(year, month - 1 + installmentNumber, 1);
+  const yyyy = due.getFullYear();
+  const mm = String(due.getMonth() + 1).padStart(2, "0");
+  return `${yyyy}-${mm}-01`;
+}
+
+function formatDueMonth(dueDate: string): string {
+  const [year, month] = dueDate.split("-").map(Number);
+  return `${MONTH_NAMES_ES[month - 1]} ${year}`;
+}
+
+function splitIntoInstallments(total: number, count: number): number[] {
+  if (count < 1) return [];
+  const totalCents = Math.round(total * 100);
+  const base = Math.floor(totalCents / count);
+  const remainder = totalCents % count;
+  return Array.from({ length: count }, (_, i) => (base + (i < remainder ? 1 : 0)) / 100);
+}
+
+function mapRowToFamilyItem(row: {
+  id: string;
+  name: string;
+  total_amount: number;
+  purchase_date: string;
+  notes: string | null;
+  installment_count: number;
+  status: string;
+  created_at: string;
+  completed_at: string | null;
+}): FamilyFinancingItem {
+  return {
+    id: String(row.id),
+    name: row.name,
+    totalAmount: Number(row.total_amount),
+    purchaseDate: row.purchase_date,
+    notes: row.notes,
+    installmentCount: Number(row.installment_count),
+    status: row.status === "completed" ? "completed" : "in_progress",
+    createdAt: row.created_at,
+    completedAt: row.completed_at,
+  };
+}
+
+function mapRowToFamilyInstallment(
+  row: {
+    id: string;
+    item_id: string;
+    installment_number: number;
+    amount: number;
+    due_date?: string | null;
+    is_paid: boolean;
+    paid_at: string | null;
+    created_at: string;
+  },
+  purchaseDate?: string,
+): FamilyFinancingInstallment {
+  const dueDate =
+    row.due_date ??
+    (purchaseDate ? getDueDateForInstallment(purchaseDate, Number(row.installment_number)) : todayIso());
+  return {
+    id: String(row.id),
+    itemId: String(row.item_id),
+    installmentNumber: Number(row.installment_number),
+    amount: Number(row.amount),
+    dueDate,
+    isPaid: Boolean(row.is_paid),
+    paidAt: row.paid_at,
+    createdAt: row.created_at,
+  };
 }
 
 const formatCurrency = (value: number) =>
@@ -257,9 +355,23 @@ export function App() {
   const [txAmountError, setTxAmountError] = useState<string | null>(null);
 
   const [savingsGoals, setSavingsGoals] = useState<SavingsGoal[]>([]);
-  const [attachToGoal, setAttachToGoal] = useState(false);
-  const [selectedGoalIdForRetention, setSelectedGoalIdForRetention] = useState<string | null>(null);
   const [savingsContributions, setSavingsContributions] = useState<SavingsContribution[]>([]);
+  const [familyItems, setFamilyItems] = useState<FamilyFinancingItem[]>([]);
+  const [familyInstallments, setFamilyInstallments] = useState<FamilyFinancingInstallment[]>([]);
+  const [familyForm, setFamilyForm] = useState({
+    name: "",
+    totalAmount: "",
+    purchaseDate: todayIso(),
+    notes: "",
+    installmentCount: "1",
+  });
+  const [familyFormError, setFamilyFormError] = useState<string | null>(null);
+  const [editingFamilyItemId, setEditingFamilyItemId] = useState<string | null>(null);
+  const [showFamilyModal, setShowFamilyModal] = useState(false);
+  const [confirmDeleteFamilyItem, setConfirmDeleteFamilyItem] = useState<FamilyFinancingItem | null>(null);
+  const [editingFamilyInstallment, setEditingFamilyInstallment] = useState<FamilyFinancingInstallment | null>(null);
+  const [installmentEditForm, setInstallmentEditForm] = useState({ amount: "", dueMonth: "" });
+  const [installmentEditError, setInstallmentEditError] = useState<string | null>(null);
   const [goalForm, setGoalForm] = useState({ name: "", targetAmount: "", deadline: "", category: "" });
   const [goalFormError, setGoalFormError] = useState<string | null>(null);
   const [editingGoalId, setEditingGoalId] = useState<string | null>(null);
@@ -280,6 +392,8 @@ export function App() {
   const [calendarHoveredDate, setCalendarHoveredDate] = useState<string | null>(null);
   const goalsSliderRef = useRef<HTMLDivElement | null>(null);
   const goalsDragRef = useRef({ startX: 0, startScrollLeft: 0 });
+  const familySliderRef = useRef<HTMLDivElement | null>(null);
+  const familyDragRef = useRef({ startX: 0, startScrollLeft: 0 });
   const achievementsSliderRef = useRef<HTMLDivElement | null>(null);
   const achievementsDragRef = useRef({ startX: 0, startScrollLeft: 0 });
   const upcomingDashboardSliderRef = useRef<HTMLDivElement | null>(null);
@@ -296,6 +410,8 @@ export function App() {
           { data: salaryRows },
           { data: goalsRows },
           { data: contributionsRows },
+          { data: familyItemsRows },
+          { data: familyInstallmentsRows },
         ] = await Promise.all([
           supabase
             .from("movements")
@@ -317,6 +433,14 @@ export function App() {
             .from("savings_goal_contributions")
             .select("id, goal_id, amount, source, created_at, movement_id")
             .order("created_at", { ascending: true }),
+          supabase
+            .from("family_financing_items")
+            .select("id, name, total_amount, purchase_date, notes, installment_count, status, created_at, completed_at")
+            .order("created_at", { ascending: false }),
+          supabase
+            .from("family_financing_installments")
+            .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
+            .order("installment_number", { ascending: true }),
         ]);
 
         if (movements) {
@@ -377,6 +501,48 @@ export function App() {
               createdAt: c.created_at,
               movementId: typeof c.movement_id === "number" ? c.movement_id : c.movement_id ?? null,
             })),
+          );
+        }
+
+        if (familyItemsRows && Array.isArray(familyItemsRows)) {
+          setFamilyItems(
+            familyItemsRows.map((row: {
+              id: string;
+              name: string;
+              total_amount: number;
+              purchase_date: string;
+              notes: string | null;
+              installment_count: number;
+              status: string;
+              created_at: string;
+              completed_at: string | null;
+            }) => mapRowToFamilyItem(row)),
+          );
+        }
+
+        if (familyInstallmentsRows && Array.isArray(familyInstallmentsRows)) {
+          const purchaseDateByItemId = new Map(
+            (familyItemsRows ?? []).map((row: { id: string; purchase_date: string }) => [
+              String(row.id),
+              row.purchase_date as string,
+            ]),
+          );
+          setFamilyInstallments(
+            familyInstallmentsRows.map((row: {
+              id: string;
+              item_id: string;
+              installment_number: number;
+              amount: number;
+              due_date?: string | null;
+              is_paid: boolean;
+              paid_at: string | null;
+              created_at: string;
+            }) =>
+              mapRowToFamilyInstallment(
+                row,
+                purchaseDateByItemId.get(String(row.item_id)),
+              ),
+            ),
           );
         }
       } catch {
@@ -755,8 +921,6 @@ export function App() {
     setTxDate(todayIso());
     setTxDescription("");
     setTxAmountError(null);
-    setAttachToGoal(false);
-    setSelectedGoalIdForRetention(null);
     setShowNewTxModal(true);
   };
 
@@ -818,66 +982,6 @@ export function App() {
     };
 
     setEntries((prev) => [movement, ...prev]);
-
-    if (txType === "income" && attachToGoal && selectedGoalIdForRetention) {
-      const retentionAmount = Math.round(parsed * 0.05 * 100) / 100;
-      if (retentionAmount > 0) {
-        const { data: contribData, error: contribError } = await supabase
-          .from("savings_goal_contributions")
-          .insert({
-            goal_id: selectedGoalIdForRetention,
-            amount: retentionAmount,
-            source: "retention",
-            movement_id: movement.id,
-          })
-          .select("id, goal_id, amount, source, created_at, movement_id")
-          .single();
-        if (!contribError && contribData) {
-          const c = contribData as {
-            id: string;
-            goal_id: string;
-            amount: number;
-            source: string;
-            created_at: string;
-            movement_id?: number | null;
-          };
-          setSavingsContributions((prev) => [
-            ...prev,
-            {
-              id: String(c.id),
-              goalId: String(c.goal_id),
-              amount: Number(c.amount),
-              source: "retention",
-              createdAt: c.created_at,
-              movementId: typeof c.movement_id === "number" ? c.movement_id : c.movement_id ?? null,
-            },
-          ]);
-
-          const goal = savingsGoals.find((g) => g.id === selectedGoalIdForRetention);
-          if (goal) {
-            const newCurrent = goal.currentAmount + retentionAmount;
-            const updatedGoal: SavingsGoal = { ...goal, currentAmount: newCurrent };
-            const newStatus = recalcGoalStatus(updatedGoal);
-            await supabase
-              .from("savings_goals")
-              .update({ current_amount: newCurrent, status: newStatus })
-              .eq("id", goal.id);
-            setSavingsGoals((prev) =>
-              prev.map((g) =>
-                g.id === goal.id
-                  ? {
-                      ...g,
-                      currentAmount: newCurrent,
-                      status: newStatus,
-                    }
-                  : g,
-              ),
-            );
-          }
-        }
-      }
-    }
-
     closeNewTxModal();
   };
 
@@ -1246,15 +1350,453 @@ export function App() {
     setEditingContribution(null);
   };
 
-  const getGoalProgressPct = (goal: SavingsGoalDemo) => {
+  const getFamilyItemInstallments = (itemId: string) =>
+    familyInstallments
+      .filter((i) => i.itemId === itemId)
+      .sort((a, b) => a.installmentNumber - b.installmentNumber);
+
+  const getFamilyItemInstallmentsTotal = (itemId: string) =>
+    getFamilyItemInstallments(itemId).reduce((sum, i) => sum + i.amount, 0);
+
+  const getFamilyItemPaidAmount = (itemId: string) =>
+    getFamilyItemInstallments(itemId)
+      .filter((i) => i.isPaid)
+      .reduce((sum, i) => sum + i.amount, 0);
+
+  const getFamilyItemRemaining = (item: FamilyFinancingItem) =>
+    Math.max(0, Math.round((item.totalAmount - getFamilyItemPaidAmount(item.id)) * 100) / 100);
+
+  const getFamilyItemProgressPct = (item: FamilyFinancingItem) => {
+    if (!item.totalAmount || item.totalAmount <= 0) return 0;
+    return Math.min(100, (getFamilyItemPaidAmount(item.id) / item.totalAmount) * 100);
+  };
+
+  const updateFamilyItemStatus = async (
+    item: FamilyFinancingItem,
+    installments: FamilyFinancingInstallment[],
+  ) => {
+    const allPaid = installments.length > 0 && installments.every((i) => i.isPaid);
+    const newStatus: FamilyFinancingStatus = allPaid ? "completed" : "in_progress";
+    const completedAt = allPaid ? new Date().toISOString() : null;
+    if (item.status === newStatus && (allPaid ? item.completedAt : !item.completedAt)) return;
+    const { error } = await supabase
+      .from("family_financing_items")
+      .update({ status: newStatus, completed_at: completedAt })
+      .eq("id", item.id);
+    if (error) return;
+    setFamilyItems((prev) =>
+      prev.map((row) =>
+        row.id === item.id ? { ...row, status: newStatus, completedAt } : row,
+      ),
+    );
+  };
+
+  const resetFamilyForm = () => {
+    setFamilyForm({
+      name: "",
+      totalAmount: "",
+      purchaseDate: todayIso(),
+      notes: "",
+      installmentCount: "1",
+    });
+    setFamilyFormError(null);
+    setEditingFamilyItemId(null);
+  };
+
+  const handleFamilyFieldChange =
+    (field: "name" | "totalAmount" | "purchaseDate" | "notes" | "installmentCount") =>
+    (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      setFamilyForm((prev) => ({ ...prev, [field]: event.target.value }));
+      setFamilyFormError(null);
+    };
+
+  const syncFamilyUnpaidInstallments = async (
+    item: FamilyFinancingItem,
+    currentInstallments: FamilyFinancingInstallment[],
+    newInstallmentCount: number,
+    newTotalAmount: number,
+  ): Promise<{ installments: FamilyFinancingInstallment[] } | { error: string }> => {
+    const paid = currentInstallments
+      .filter((i) => i.isPaid)
+      .sort((a, b) => a.installmentNumber - b.installmentNumber);
+    const paidTotal = paid.reduce((sum, i) => sum + i.amount, 0);
+
+    if (newTotalAmount + 0.001 < paidTotal) {
+      return {
+        error: `El monto total no puede ser menor a lo ya pagado (${formatCurrency(paidTotal)}).`,
+      };
+    }
+    if (newInstallmentCount < paid.length) {
+      return {
+        error: `No podés reducir a menos de ${paid.length} cuota(s) porque ya hay cuotas pagadas.`,
+      };
+    }
+
+    const remaining = Math.round((newTotalAmount - paidTotal) * 100) / 100;
+    const unpaidCount = newInstallmentCount - paid.length;
+    const unpaidAmounts =
+      unpaidCount > 0 ? splitIntoInstallments(Math.max(0, remaining), unpaidCount) : [];
+
+    const unpaidIds = currentInstallments.filter((i) => !i.isPaid).map((i) => i.id);
+    if (unpaidIds.length > 0) {
+      const { error } = await supabase
+        .from("family_financing_installments")
+        .delete()
+        .in("id", unpaidIds);
+      if (error) return { error: error.message || "No se pudieron actualizar las cuotas." };
+    }
+
+    let newUnpaidRows: FamilyFinancingInstallment[] = [];
+    if (unpaidAmounts.length > 0) {
+      const inserts = unpaidAmounts.map((amount, idx) => {
+        const installmentNumber = paid.length + idx + 1;
+        return {
+          item_id: item.id,
+          installment_number: installmentNumber,
+          amount,
+          due_date: getDueDateForInstallment(item.purchaseDate, installmentNumber),
+          is_paid: false,
+        };
+      });
+      const { data, error } = await supabase
+        .from("family_financing_installments")
+        .insert(inserts)
+        .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at");
+      if (error) return { error: error.message || "No se pudieron crear las cuotas." };
+      newUnpaidRows = (data ?? []).map((row: {
+        id: string;
+        item_id: string;
+        installment_number: number;
+        amount: number;
+        due_date?: string | null;
+        is_paid: boolean;
+        paid_at: string | null;
+        created_at: string;
+      }) => mapRowToFamilyInstallment(row, item.purchaseDate));
+    }
+
+    const nextInstallments = [...paid, ...newUnpaidRows].sort(
+      (a, b) => a.installmentNumber - b.installmentNumber,
+    );
+
+    setFamilyInstallments((prev) => [
+      ...prev.filter((i) => i.itemId !== item.id),
+      ...nextInstallments,
+    ]);
+
+    return { installments: nextInstallments };
+  };
+
+  const handleSubmitFamilyItem = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const name = familyForm.name.trim();
+    const notes = familyForm.notes.trim();
+    const total = Number(familyForm.totalAmount.replace(/\s/g, "").replace(",", "."));
+    const installmentCount = Number(familyForm.installmentCount);
+
+    if (!name) {
+      setFamilyFormError("Ingresa un nombre para el item.");
+      return;
+    }
+    if (!familyForm.totalAmount || Number.isNaN(total) || total <= 0) {
+      setFamilyFormError("Ingresa un monto total mayor a 0.");
+      return;
+    }
+    if (!familyForm.purchaseDate || !/^\d{4}-\d{2}-\d{2}$/.test(familyForm.purchaseDate)) {
+      setFamilyFormError("La fecha de compra debe tener formato YYYY-MM-DD.");
+      return;
+    }
+    if (!Number.isInteger(installmentCount) || installmentCount < 1) {
+      setFamilyFormError("La cantidad de cuotas debe ser un número entero mayor o igual a 1.");
+      return;
+    }
+
+    if (editingFamilyItemId) {
+      const existing = familyItems.find((item) => item.id === editingFamilyItemId);
+      if (!existing) return;
+      const currentInstallments = getFamilyItemInstallments(existing.id);
+      const purchaseDateChanged = familyForm.purchaseDate !== existing.purchaseDate;
+      const countChanged = installmentCount !== existing.installmentCount;
+      const totalChanged = total !== existing.totalAmount;
+      const { error: updateError } = await supabase
+        .from("family_financing_items")
+        .update({
+          name,
+          total_amount: total,
+          purchase_date: familyForm.purchaseDate,
+          notes: notes || null,
+          installment_count: installmentCount,
+        })
+        .eq("id", existing.id);
+      if (updateError) {
+        setFamilyFormError(updateError.message || "No se pudo actualizar el item.");
+        return;
+      }
+
+      const updatedItem: FamilyFinancingItem = {
+        ...existing,
+        name,
+        totalAmount: total,
+        purchaseDate: familyForm.purchaseDate,
+        notes: notes || null,
+        installmentCount,
+      };
+      setFamilyItems((prev) =>
+        prev.map((item) => (item.id === existing.id ? updatedItem : item)),
+      );
+
+      if (countChanged || totalChanged) {
+        const syncResult = await syncFamilyUnpaidInstallments(
+          updatedItem,
+          currentInstallments,
+          installmentCount,
+          total,
+        );
+        if ("error" in syncResult) {
+          setFamilyFormError(syncResult.error);
+          return;
+        }
+        await updateFamilyItemStatus(updatedItem, syncResult.installments);
+      } else if (purchaseDateChanged) {
+        const unpaid = currentInstallments.filter((row) => !row.isPaid);
+        if (unpaid.length > 0) {
+          const updates = await Promise.all(
+            unpaid.map(async (row) => {
+              const dueDate = getDueDateForInstallment(familyForm.purchaseDate, row.installmentNumber);
+              const { data, error } = await supabase
+                .from("family_financing_installments")
+                .update({ due_date: dueDate })
+                .eq("id", row.id)
+                .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
+                .single();
+              if (error || !data) return row;
+              return mapRowToFamilyInstallment(
+                data as {
+                  id: string;
+                  item_id: string;
+                  installment_number: number;
+                  amount: number;
+                  due_date?: string | null;
+                  is_paid: boolean;
+                  paid_at: string | null;
+                  created_at: string;
+                },
+                familyForm.purchaseDate,
+              );
+            }),
+          );
+          const paid = currentInstallments.filter((row) => row.isPaid);
+          const nextInstallments = [...paid, ...updates].sort(
+            (a, b) => a.installmentNumber - b.installmentNumber,
+          );
+          setFamilyInstallments((prev) => [
+            ...prev.filter((row) => row.itemId !== existing.id),
+            ...nextInstallments,
+          ]);
+        }
+      }
+    } else {
+      const { data, error } = await supabase
+        .from("family_financing_items")
+        .insert({
+          name,
+          total_amount: total,
+          purchase_date: familyForm.purchaseDate,
+          notes: notes || null,
+          installment_count: installmentCount,
+          status: "in_progress",
+        })
+        .select("id, name, total_amount, purchase_date, notes, installment_count, status, created_at, completed_at")
+        .single();
+      if (error || !data) {
+        setFamilyFormError(error?.message || "No se pudo crear el item.");
+        return;
+      }
+
+      const newItem = mapRowToFamilyItem(data as {
+        id: string;
+        name: string;
+        total_amount: number;
+        purchase_date: string;
+        notes: string | null;
+        installment_count: number;
+        status: string;
+        created_at: string;
+        completed_at: string | null;
+      });
+      const amounts = splitIntoInstallments(total, installmentCount);
+      const { data: installmentRows, error: installmentError } = await supabase
+        .from("family_financing_installments")
+        .insert(
+          amounts.map((amount, idx) => ({
+            item_id: newItem.id,
+            installment_number: idx + 1,
+            amount,
+            due_date: getDueDateForInstallment(newItem.purchaseDate, idx + 1),
+            is_paid: false,
+          })),
+        )
+        .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at");
+      if (installmentError) {
+        setFamilyFormError(installmentError.message || "No se pudieron crear las cuotas.");
+        return;
+      }
+
+      const newInstallments = (installmentRows ?? []).map((row: {
+        id: string;
+        item_id: string;
+        installment_number: number;
+        amount: number;
+        due_date?: string | null;
+        is_paid: boolean;
+        paid_at: string | null;
+        created_at: string;
+      }) => mapRowToFamilyInstallment(row, newItem.purchaseDate));
+
+      setFamilyItems((prev) => [newItem, ...prev]);
+      setFamilyInstallments((prev) => [...prev, ...newInstallments]);
+    }
+
+    resetFamilyForm();
+    setShowFamilyModal(false);
+  };
+
+  const startEditFamilyItem = (item: FamilyFinancingItem) => {
+    setEditingFamilyItemId(item.id);
+    setFamilyForm({
+      name: item.name,
+      totalAmount: String(item.totalAmount),
+      purchaseDate: item.purchaseDate,
+      notes: item.notes ?? "",
+      installmentCount: String(item.installmentCount),
+    });
+    setFamilyFormError(null);
+    setShowFamilyModal(true);
+  };
+
+  const toggleFamilyInstallmentPaid = async (installment: FamilyFinancingInstallment) => {
+    const item = familyItems.find((row) => row.id === installment.itemId);
+    if (!item) return;
+    const newPaid = !installment.isPaid;
+    const paidAt = newPaid ? new Date().toISOString() : null;
+    const { data, error } = await supabase
+      .from("family_financing_installments")
+      .update({ is_paid: newPaid, paid_at: paidAt })
+      .eq("id", installment.id)
+      .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
+      .single();
+    if (error || !data) return;
+
+    const updatedInstallment = mapRowToFamilyInstallment(
+      data as {
+        id: string;
+        item_id: string;
+        installment_number: number;
+        amount: number;
+        due_date?: string | null;
+        is_paid: boolean;
+        paid_at: string | null;
+        created_at: string;
+      },
+      item.purchaseDate,
+    );
+    const nextInstallments = getFamilyItemInstallments(item.id).map((row) =>
+      row.id === installment.id ? updatedInstallment : row,
+    );
+    setFamilyInstallments((prev) =>
+      prev.map((row) => (row.id === installment.id ? updatedInstallment : row)),
+    );
+    await updateFamilyItemStatus(item, nextInstallments);
+  };
+
+  const startEditFamilyInstallment = (installment: FamilyFinancingInstallment) => {
+    setEditingFamilyInstallment(installment);
+    setInstallmentEditForm({
+      amount: String(installment.amount),
+      dueMonth: installment.dueDate.slice(0, 7),
+    });
+    setInstallmentEditError(null);
+  };
+
+  const closeFamilyInstallmentModal = () => {
+    setEditingFamilyInstallment(null);
+    setInstallmentEditForm({ amount: "", dueMonth: "" });
+    setInstallmentEditError(null);
+  };
+
+  const handleSubmitFamilyInstallmentEdit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!editingFamilyInstallment) return;
+    const item = familyItems.find((row) => row.id === editingFamilyInstallment.itemId);
+    if (!item) return;
+
+    const parsedAmount = Number(installmentEditForm.amount.replace(/\s/g, "").replace(",", "."));
+    if (!installmentEditForm.amount || Number.isNaN(parsedAmount) || parsedAmount <= 0) {
+      setInstallmentEditError("Ingresa un monto válido mayor a 0.");
+      return;
+    }
+    if (!installmentEditForm.dueMonth || !/^\d{4}-\d{2}$/.test(installmentEditForm.dueMonth)) {
+      setInstallmentEditError("Selecciona un mes de pago válido.");
+      return;
+    }
+
+    const dueDate = `${installmentEditForm.dueMonth}-01`;
+    const { data, error } = await supabase
+      .from("family_financing_installments")
+      .update({ amount: parsedAmount, due_date: dueDate })
+      .eq("id", editingFamilyInstallment.id)
+      .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
+      .single();
+    if (error || !data) {
+      setInstallmentEditError(error?.message || "No se pudo actualizar la cuota.");
+      return;
+    }
+
+    const updatedInstallment = mapRowToFamilyInstallment(
+      data as {
+        id: string;
+        item_id: string;
+        installment_number: number;
+        amount: number;
+        due_date?: string | null;
+        is_paid: boolean;
+        paid_at: string | null;
+        created_at: string;
+      },
+      item.purchaseDate,
+    );
+    setFamilyInstallments((prev) =>
+      prev.map((row) => (row.id === editingFamilyInstallment.id ? updatedInstallment : row)),
+    );
+    closeFamilyInstallmentModal();
+  };
+
+  const confirmDeleteFamilyItemOk = async () => {
+    if (!confirmDeleteFamilyItem) return;
+    const id = confirmDeleteFamilyItem.id;
+    const { error } = await supabase.from("family_financing_items").delete().eq("id", id);
+    if (error) {
+      setConfirmDeleteFamilyItem(null);
+      return;
+    }
+    setFamilyItems((prev) => prev.filter((item) => item.id !== id));
+    setFamilyInstallments((prev) => prev.filter((row) => row.itemId !== id));
+    setConfirmDeleteFamilyItem(null);
+  };
+
+  const confirmDeleteFamilyItemCancel = () => {
+    setConfirmDeleteFamilyItem(null);
+  };
+
+  const getGoalProgressPct = (goal: SavingsGoal) => {
     if (!goal.targetAmount || goal.targetAmount <= 0) return 0;
     return Math.min(100, (goal.currentAmount / goal.targetAmount) * 100);
   };
 
-  const getGoalRemainingAmount = (goal: SavingsGoalDemo) =>
+  const getGoalRemainingAmount = (goal: SavingsGoal) =>
     Math.max(0, goal.targetAmount - goal.currentAmount);
 
-  const getGoalDaysLeft = (goal: SavingsGoalDemo) => {
+  const getGoalDaysLeft = (goal: SavingsGoal) => {
     if (!goal.deadline) return null;
     const [year, month, day] = goal.deadline.split("-");
     const d = new Date(Number(year), Number(month) - 1, Number(day));
@@ -1277,6 +1819,40 @@ export function App() {
     [savingsGoals],
   );
 
+  const activeFamilyItems = useMemo(
+    () => familyItems.filter((item) => item.status !== "completed"),
+    [familyItems],
+  );
+
+  const completedFamilyItems = useMemo(
+    () => familyItems.filter((item) => item.status === "completed"),
+    [familyItems],
+  );
+
+  const familyPendingTotal = useMemo(
+    () => activeFamilyItems.reduce((sum, item) => sum + getFamilyItemRemaining(item), 0),
+    [activeFamilyItems, familyInstallments],
+  );
+
+  const currentMonthFamilySummary = useMemo(() => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    const monthInstallments = familyInstallments.filter((inst) => {
+      const [dueYear, dueMonth] = inst.dueDate.split("-").map(Number);
+      return dueYear === year && dueMonth === month;
+    });
+    const total = monthInstallments.reduce((sum, inst) => sum + inst.amount, 0);
+    const paidCount = monthInstallments.filter((inst) => inst.isPaid).length;
+    const count = monthInstallments.length;
+    let status: "paid" | "pending" | "partial" | "empty" = "empty";
+    if (count === 0) status = "empty";
+    else if (paidCount === count) status = "paid";
+    else if (paidCount === 0) status = "pending";
+    else status = "partial";
+    return { year, month, total, paidCount, count, status };
+  }, [familyInstallments]);
+
   useEffect(() => {
     if (
       !confirmDelete &&
@@ -1286,6 +1862,9 @@ export function App() {
       !showSalaryForm &&
       !editingSalaryId &&
       !showGoalModal &&
+      !showFamilyModal &&
+      !editingFamilyInstallment &&
+      !confirmDeleteFamilyItem &&
       !selectedGoalForContribution
     )
       return;
@@ -1300,6 +1879,12 @@ export function App() {
           setShowGoalModal(false);
           resetGoalForm();
         }
+        if (showFamilyModal) {
+          setShowFamilyModal(false);
+          resetFamilyForm();
+        }
+        closeFamilyInstallmentModal();
+        confirmDeleteFamilyItemCancel();
         if (selectedGoalForContribution) {
           closeContributionModal();
         }
@@ -1317,6 +1902,9 @@ export function App() {
     showSalaryForm,
     editingSalaryId,
     showGoalModal,
+    showFamilyModal,
+    editingFamilyInstallment,
+    confirmDeleteFamilyItem,
     selectedGoalForContribution,
     expandedChartModal,
     showCalendarModal,
@@ -1380,6 +1968,16 @@ export function App() {
             </a>
             <a
               href="#"
+              className={`sidebar-nav-item ${activeView === "familyFinancing" ? "sidebar-nav-item-active" : ""}`}
+              onClick={(e) => { e.preventDefault(); setActiveView("familyFinancing"); }}
+            >
+              <span className="sidebar-nav-icon" aria-hidden>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+              </span>
+              Financiamiento familia
+            </a>
+            <a
+              href="#"
               className={`sidebar-nav-item ${showCalendarModal ? "sidebar-nav-item-active" : ""}`}
               onClick={(e) => {
                 e.preventDefault();
@@ -1420,7 +2018,9 @@ export function App() {
                 ? "Dashboard"
                 : activeView === "upcoming"
                 ? "Próximos salarios"
-                : "Metas de Ahorro"}
+                : activeView === "goals"
+                ? "Metas de Ahorro"
+                : "Financiamiento familia"}
             </span>
           </nav>
           {activeView === "dashboard" && (
@@ -1463,6 +2063,38 @@ export function App() {
                     ? `Próxima meta vence en ${daysLeft} día${daysLeft !== 1 ? "s" : ""}`
                     : "Organiza y avanza en tus objetivos";
                 })()}
+              </span>
+            </div>
+          )}
+          {activeView === "familyFinancing" && (
+            <div
+              className={`reference-bar reference-bar-compact reference-bar--family ${
+                currentMonthFamilySummary.status === "paid"
+                  ? "reference-bar--family-paid"
+                  : currentMonthFamilySummary.status === "partial"
+                  ? "reference-bar--family-partial"
+                  : ""
+              }`}
+            >
+              <span className="reference-left">
+                <span className="reference-main">
+                  Mes actual: {MONTH_NAMES_ES[currentMonthFamilySummary.month - 1]}{" "}
+                  {currentMonthFamilySummary.year}
+                </span>
+                <span className="reference-amount">
+                  {currentMonthFamilySummary.count === 0
+                    ? "Sin cuotas este mes"
+                    : `${formatCurrency(currentMonthFamilySummary.total)} a cobrar`}
+                </span>
+              </span>
+              <span className="reference-right">
+                {currentMonthFamilySummary.count === 0
+                  ? "—"
+                  : currentMonthFamilySummary.status === "paid"
+                  ? "Pagado"
+                  : currentMonthFamilySummary.status === "pending"
+                  ? "Pendiente"
+                  : `Parcial · ${currentMonthFamilySummary.paidCount}/${currentMonthFamilySummary.count} pagadas`}
               </span>
             </div>
           )}
@@ -1806,6 +2438,196 @@ export function App() {
           </section>
         )}
 
+        {activeView === "familyFinancing" && (
+          <section className="panel panel-family">
+            <div className="goals-layout">
+              <div className="goals-list-card">
+                <div className="goals-list-header">
+                  <h2 className="panel-title">Financiamiento familia</h2>
+                  <div className="goals-list-header-right">
+                    <p className="panel-sub-right">
+                      {activeFamilyItems.length === 0
+                        ? "Todavía no cargaste items"
+                        : `${activeFamilyItems.length} item${activeFamilyItems.length !== 1 ? "s" : ""} en curso · Pendiente total ${formatCurrency(familyPendingTotal)}`}
+                    </p>
+                    <button
+                      type="button"
+                      className="button goals-add-button"
+                      onClick={() => {
+                        resetFamilyForm();
+                        setShowFamilyModal(true);
+                      }}
+                    >
+                      + Nuevo item
+                    </button>
+                  </div>
+                </div>
+
+                {activeFamilyItems.length === 0 ? (
+                  <div className="goals-empty-state">
+                    <p className="goals-empty-title">Registrá una compra financiada</p>
+                    <p className="goals-empty-sub">
+                      Por ejemplo: electrodoméstico, medicamentos o compras del super que tus papás van devolviendo en cuotas.
+                    </p>
+                  </div>
+                ) : (
+                  <div
+                    ref={familySliderRef}
+                    className="goals-grid goals-slider"
+                    onMouseDown={makeHorizontalDragHandler(familySliderRef, familyDragRef)}
+                  >
+                    {activeFamilyItems.map((item) => {
+                      const installments = getFamilyItemInstallments(item.id);
+                      const paidAmount = getFamilyItemPaidAmount(item.id);
+                      const remaining = getFamilyItemRemaining(item);
+                      const progressPct = getFamilyItemProgressPct(item);
+                      const paidCount = installments.filter((row) => row.isPaid).length;
+                      const installmentsTotal = getFamilyItemInstallmentsTotal(item.id);
+                      const installmentsMismatch =
+                        Math.abs(installmentsTotal - item.totalAmount) > 0.01;
+                      return (
+                        <article key={item.id} className="goal-card family-item-card">
+                          <header className="goal-card-header">
+                            <div>
+                              <h3 className="goal-card-title">{item.name}</h3>
+                              <p className="goal-card-category family-item-date">
+                                Compra: {formatDisplayDate(item.purchaseDate)}
+                              </p>
+                              {item.notes && (
+                                <p className="family-item-notes">{item.notes}</p>
+                              )}
+                            </div>
+                            <span className="goal-status-chip goal-status-chip--in_progress">
+                              En curso
+                            </span>
+                          </header>
+
+                          <div className="goal-progress">
+                            <div className="goal-progress-bar">
+                              <div
+                                className="goal-progress-fill goal-progress-fill--in_progress"
+                                style={{ width: `${progressPct}%` }}
+                              />
+                            </div>
+                            <div className="goal-progress-row">
+                              <span className="goal-progress-main">
+                                Pagado{" "}
+                                <strong>
+                                  {formatCurrency(paidAmount)} / {formatCurrency(item.totalAmount)}
+                                </strong>
+                              </span>
+                              <span className="goal-progress-pct">
+                                {progressPct.toFixed(0)}%
+                              </span>
+                            </div>
+                            <p className="goal-progress-remaining">
+                              Restan {formatCurrency(remaining)} de {formatCurrency(item.totalAmount)}.
+                            </p>
+                            <p className="family-installments-summary">
+                              {paidCount}/{installments.length} cuota{installments.length !== 1 ? "s" : ""} pagada{paidCount !== 1 ? "s" : ""}
+                            </p>
+                            {installmentsMismatch && (
+                              <p className="family-installments-hint">
+                                Las cuotas suman {formatCurrency(installmentsTotal)} (total del item:{" "}
+                                {formatCurrency(item.totalAmount)})
+                              </p>
+                            )}
+                          </div>
+
+                          <div className="family-installments">
+                            {installments.map((installment) => (
+                              <div
+                                key={installment.id}
+                                className={`family-installment-row ${installment.isPaid ? "family-installment-row--paid" : ""}`}
+                              >
+                                <label className="family-installment-check">
+                                  <input
+                                    type="checkbox"
+                                    checked={installment.isPaid}
+                                    onChange={() => void toggleFamilyInstallmentPaid(installment)}
+                                  />
+                                  <span>
+                                    Cuota {installment.installmentNumber} · {formatDueMonth(installment.dueDate)}
+                                  </span>
+                                </label>
+                                <div className="family-installment-actions">
+                                  <span className="family-installment-amount">
+                                    {formatCurrency(installment.amount)}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="button button-secondary family-installment-edit-btn"
+                                    onClick={() => startEditFamilyInstallment(installment)}
+                                    aria-label={`Editar cuota ${installment.installmentNumber}`}
+                                  >
+                                    Editar
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <footer className="goal-card-footer">
+                            <button
+                              type="button"
+                              className="button button-secondary goal-card-btn goal-card-btn-icon"
+                              data-tooltip="Editar"
+                              onClick={() => startEditFamilyItem(item)}
+                              aria-label="Editar"
+                            >
+                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            </button>
+                            <button
+                              type="button"
+                              className="button button-secondary goal-card-btn goal-card-btn-icon"
+                              data-tooltip="Eliminar"
+                              onClick={() => setConfirmDeleteFamilyItem(item)}
+                              aria-label="Eliminar"
+                            >
+                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                            </button>
+                          </footer>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {completedFamilyItems.length > 0 && (
+                <section className="goals-achievements-section">
+                  <h2 className="panel-title goals-achievements-title">Completados</h2>
+                  <div
+                    className="goals-grid goals-slider goals-achievements-grid"
+                  >
+                    {completedFamilyItems.map((item) => (
+                      <article key={item.id} className="goal-achievement-card">
+                        <div className="goal-achievement-header">
+                          <span className="goal-achievement-icon" aria-hidden>
+                            ✓
+                          </span>
+                          <div>
+                            <h3 className="goal-achievement-title">{item.name}</h3>
+                            <p className="goal-achievement-category">
+                              {formatCurrency(item.totalAmount)} · {item.installmentCount} cuota{item.installmentCount !== 1 ? "s" : ""}
+                            </p>
+                          </div>
+                        </div>
+                        <p className="goal-achievement-amount">
+                          Compra del {formatDisplayDate(item.purchaseDate)}
+                        </p>
+                        {item.notes && (
+                          <p className="family-item-notes family-item-notes--achievement">{item.notes}</p>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+          </section>
+        )}
+
       {confirmDelete && (
         <div
           className="modal-overlay"
@@ -1890,7 +2712,7 @@ export function App() {
         >
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h2 id="modal-reset-goal-title" className="modal-title">
-              Resetear progreso de la meta
+              Resetear progreso
             </h2>
             <p className="modal-body">
               ¿Seguro que querés resetear el progreso de esta meta a 0?
@@ -1903,10 +2725,235 @@ export function App() {
               >
                 Cancelar
               </button>
-              <button type="button" className="button" onClick={handleResetGoalProgress}>
+              <button type="button" className="button" onClick={() => void handleResetGoalProgress()}>
                 Resetear
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDeleteFamilyItem && (
+        <div
+          className="modal-overlay"
+          onClick={confirmDeleteFamilyItemCancel}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-delete-family-title"
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-delete-family-title" className="modal-title">
+              Eliminar item
+            </h2>
+            <p className="modal-body">
+              ¿Seguro que querés eliminar este item de financiamiento?
+              <br />
+              <strong>
+                {confirmDeleteFamilyItem.name} · {formatCurrency(confirmDeleteFamilyItem.totalAmount)}
+              </strong>
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={confirmDeleteFamilyItemCancel}
+              >
+                Cancelar
+              </button>
+              <button type="button" className="button" onClick={() => void confirmDeleteFamilyItemOk()}>
+                Eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showFamilyModal && (
+        <div
+          className="modal-overlay"
+          onClick={() => {
+            setShowFamilyModal(false);
+            resetFamilyForm();
+          }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-family-title"
+        >
+          <div
+            className="modal modal-goal-form"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-goal-header">
+              <div>
+                <h2 id="modal-family-title" className="modal-title">
+                  {editingFamilyItemId ? "Editar item" : "Nuevo item"}
+                </h2>
+                <p className="modal-goal-subtitle">
+                  Registrá una compra financiada y cuántas cuotas van a devolver.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close-btn"
+                onClick={() => {
+                  setShowFamilyModal(false);
+                  resetFamilyForm();
+                }}
+                aria-label="Cerrar"
+              >
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitFamilyItem} className="modal-goal-form-body">
+              <div className="goals-modal-fields">
+                <div className="field">
+                  <div className="field-label-row">
+                    <label className="field-label">Nombre del producto</label>
+                  </div>
+                  <input
+                    type="text"
+                    className="input"
+                    placeholder="Ej. Heladera, medicamentos, supermercado"
+                    value={familyForm.name}
+                    onChange={handleFamilyFieldChange("name")}
+                  />
+                </div>
+                <div className="field">
+                  <div className="field-label-row">
+                    <label className="field-label">Monto total</label>
+                    <span className="field-hint">Sin comas, solo números</span>
+                  </div>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    className="input"
+                    placeholder="2500"
+                    value={familyForm.totalAmount}
+                    onChange={handleFamilyFieldChange("totalAmount")}
+                  />
+                </div>
+                <div className="field">
+                  <div className="field-label-row">
+                    <label className="field-label">Fecha de compra</label>
+                  </div>
+                  <input
+                    type="date"
+                    className="input"
+                    value={familyForm.purchaseDate}
+                    onChange={handleFamilyFieldChange("purchaseDate")}
+                  />
+                </div>
+                <div className="field">
+                  <div className="field-label-row">
+                    <label className="field-label">Cantidad de cuotas</label>
+                    <span className="field-hint">1 = pago único</span>
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    className="input"
+                    value={familyForm.installmentCount}
+                    onChange={handleFamilyFieldChange("installmentCount")}
+                  />
+                </div>
+                <div className="field">
+                  <div className="field-label-row">
+                    <label className="field-label">Notas (opcional)</label>
+                  </div>
+                  <textarea
+                    className="textarea"
+                    placeholder="Detalle adicional sobre la compra"
+                    value={familyForm.notes}
+                    onChange={handleFamilyFieldChange("notes")}
+                  />
+                </div>
+              </div>
+              {familyFormError && (
+                <div className="error-text goals-error-text">{familyFormError}</div>
+              )}
+              <div className="modal-actions modal-goal-actions">
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() => {
+                    setShowFamilyModal(false);
+                    resetFamilyForm();
+                  }}
+                >
+                  Cancelar
+                </button>
+                <button type="submit" className="button">
+                  {editingFamilyItemId ? "Guardar cambios" : "Crear item"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {editingFamilyInstallment && (
+        <div
+          className="modal-overlay"
+          onClick={closeFamilyInstallmentModal}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-family-installment-title"
+        >
+          <div className="modal modal-family-installment" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-family-installment-title" className="modal-title">
+              Editar cuota {editingFamilyInstallment.installmentNumber}
+            </h2>
+            <p className="modal-body modal-family-installment-sub">
+              Ajustá el monto o el mes de pago si adelantaron, atrasaron o pagaron un valor distinto.
+            </p>
+            <form onSubmit={handleSubmitFamilyInstallmentEdit}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Monto de la cuota</label>
+                </div>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="input"
+                  value={installmentEditForm.amount}
+                  onChange={(e) => {
+                    setInstallmentEditForm((prev) => ({ ...prev, amount: e.target.value }));
+                    setInstallmentEditError(null);
+                  }}
+                />
+              </div>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Mes de pago</label>
+                </div>
+                <input
+                  type="month"
+                  className="input"
+                  value={installmentEditForm.dueMonth}
+                  onChange={(e) => {
+                    setInstallmentEditForm((prev) => ({ ...prev, dueMonth: e.target.value }));
+                    setInstallmentEditError(null);
+                  }}
+                />
+              </div>
+              {installmentEditError && (
+                <div className="error-text goals-error-text">{installmentEditError}</div>
+              )}
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={closeFamilyInstallmentModal}
+                >
+                  Cancelar
+                </button>
+                <button type="submit" className="button">
+                  Guardar cambios
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -2103,38 +3150,6 @@ export function App() {
                   onChange={(e) => setTxDescription(e.target.value)}
                 />
               </div>
-
-              {txType === "income" && savingsGoals.some((g) => g.status !== "completed") && (
-                <div className="tx-field tx-field-goal">
-                  <label className="tx-label">Ahorro automático</label>
-                  <div className="tx-goal-retention-row">
-                    <label className="tx-goal-checkbox-label">
-                      <input
-                        type="checkbox"
-                        checked={attachToGoal}
-                        onChange={(e) => setAttachToGoal(e.target.checked)}
-                      />
-                      <span>Asignar 5% de este ingreso a una meta de ahorro</span>
-                    </label>
-                    {attachToGoal && (
-                      <select
-                        className="select tx-select tx-goal-select"
-                        value={selectedGoalIdForRetention ?? ""}
-                        onChange={(e) => setSelectedGoalIdForRetention(e.target.value || null)}
-                      >
-                        <option value="">Selecciona una meta</option>
-                        {savingsGoals
-                          .filter((g) => g.status !== "completed")
-                          .map((goal) => (
-                            <option key={goal.id} value={goal.id}>
-                              {goal.name}
-                            </option>
-                          ))}
-                      </select>
-                    )}
-                  </div>
-                </div>
-              )}
 
               <div className="modal-actions modal-transaction-actions">
                 <button type="button" className="button button-secondary" onClick={closeNewTxModal}>

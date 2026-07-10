@@ -2062,6 +2062,133 @@ body {
   color: #9ca3af;
 }
 
+/* Financiamiento familia */
+.panel-family {
+  margin-top: 0;
+}
+
+.family-item-card {
+  min-width: 18rem;
+}
+
+.family-item-date {
+  margin-top: 0.15rem;
+}
+
+.family-item-notes {
+  margin: 0.35rem 0 0;
+  font-size: 0.76rem;
+  color: #6b7280;
+  line-height: 1.35;
+}
+
+.family-item-notes--achievement {
+  margin-top: 0.35rem;
+}
+
+.family-installments-summary {
+  margin: 0.35rem 0 0;
+  font-size: 0.76rem;
+  color: #6b7280;
+}
+
+.family-installments {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.family-installment-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: 0.45rem;
+  background: #f9fafb;
+  border: 1px solid #f3f4f6;
+}
+
+.family-installment-row--paid {
+  background: #f0fdf4;
+  border-color: #dcfce7;
+}
+
+.family-installment-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  cursor: pointer;
+  color: #374151;
+  min-width: 0;
+}
+
+.family-installment-check input {
+  width: 0.95rem;
+  height: 0.95rem;
+  accent-color: #374151;
+  flex-shrink: 0;
+}
+
+.family-installment-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-shrink: 0;
+}
+
+.family-installment-amount {
+  font-weight: 600;
+  color: #111827;
+}
+
+.family-installment-edit-btn {
+  min-height: 1.7rem;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.72rem;
+}
+
+.family-installments-hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.72rem;
+  color: #9ca3af;
+}
+
+.modal-family-installment {
+  max-width: 24rem;
+}
+
+.modal-family-installment-sub {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  color: #6b7280;
+  font-size: 0.84rem;
+}
+
+.reference-bar--family-paid {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+}
+
+.reference-bar--family-paid .reference-main,
+.reference-bar--family-paid .reference-amount,
+.reference-bar--family-paid .reference-right {
+  color: #166534;
+}
+
+.reference-bar--family-partial {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.reference-bar--family-partial .reference-main,
+.reference-bar--family-partial .reference-amount,
+.reference-bar--family-partial .reference-right {
+  color: #b45309;
+}
+
 /* Resumen de metas en Dashboard */
 .panel-goals-summary {
   padding-top: 1.1rem;
@@ -2271,6 +2398,22 @@ body {
 
 .reference-bar--goals .reference-right {
   color: #0284c7;
+  font-weight: 600;
+}
+
+/* Financiamiento familia: tono ámbar suave */
+.reference-bar--family {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+}
+
+.reference-bar--family .reference-main,
+.reference-bar--family .reference-amount {
+  color: #c2410c;
+}
+
+.reference-bar--family .reference-right {
+  color: #ea580c;
   font-weight: 600;
 }
 
