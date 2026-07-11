@@ -3709,6 +3709,226 @@ tbody tr:hover {
   max-width: 420px;
 }
 
+.modal-projection-line-sub {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  color: #6b7280;
+  font-size: 0.84rem;
+}
+
+.modal-projection-line form .modal-actions {
+  margin-top: 1.35rem;
+}
+
+.modal-projection-add-month {
+  max-width: 380px;
+}
+
+.modal-projection-add-month form .modal-actions {
+  margin-top: 1.35rem;
+}
+
+.projection-line-type-toggle {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.projection-line-type-btn {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 500;
+  color: #4b5563;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.projection-line-type-btn:hover {
+  background: #f9fafb;
+  border-color: #d1d5db;
+}
+
+.projection-line-type-btn--active.projection-line-type-btn--income {
+  background: #ecfdf5;
+  border-color: #6ee7b7;
+  color: #047857;
+}
+
+.projection-line-type-btn--active.projection-line-type-btn--expense {
+  background: #fef2f2;
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+
+/* Proyección de Ingresos — sección en filas */
+.projection-section-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.projection-section-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.projection-section-header-actions {
+  flex-shrink: 0;
+}
+
+.projection-balance-card {
+  padding: 0.85rem 1rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fafafa;
+  max-width: 360px;
+}
+
+.projection-section-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  border-top: none;
+  margin-top: 0.25rem;
+}
+
+.projection-section-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fafafa;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.projection-section-row:hover {
+  background: #f3f4f6;
+  border-color: #d1d5db;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.projection-section-row .tx-list-desc {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: #111827;
+}
+
+.projection-section-row .tx-list-meta {
+  font-size: 0.72rem;
+}
+
+.projection-section-row-chevron {
+  flex-shrink: 0;
+  font-size: 1rem;
+  line-height: 1;
+  color: #9ca3af;
+  margin-left: 0.15rem;
+}
+
+.projection-section-row-right {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.08rem;
+}
+
+.projection-section-delta {
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.projection-section-ending {
+  font-size: 0.7rem;
+  color: #6b7280;
+  font-variant-numeric: tabular-nums;
+}
+
+.modal-projection-month-detail {
+  max-width: 560px;
+  width: calc(100vw - 2rem);
+  max-height: calc(100vh - 3rem);
+  overflow-y: auto;
+}
+
+.modal-projection-month-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.modal-projection-month-detail-sub {
+  margin: 0.2rem 0 0;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.projection-month-detail-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  margin-bottom: 0.85rem;
+  padding: 0.65rem 0.75rem;
+  border-radius: 8px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  font-size: 0.82rem;
+  color: #4b5563;
+}
+
+.projection-lines-list--detail {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.projection-line-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.projection-line-type-chip {
+  display: inline-flex;
+  align-self: flex-start;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.projection-line-type-chip--income {
+  background: #ecfdf5;
+  color: #047857;
+}
+
+.projection-line-type-chip--expense {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.modal-projection-month-detail-actions {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #e5e7eb;
+}
+
 /* Resumen Familia en Dashboard — lista compacta */
 .family-dashboard-list-wrap {
   margin-top: 0.25rem;

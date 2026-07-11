@@ -68,18 +68,21 @@ function daysUntil(d: Date): number {
 
 type ViewId = "dashboard" | "upcoming" | "familyFinancing" | "incomeProjections";
 
-const PROJECTION_MONTH_COUNT = 12;
+type ProjectionLineType = "income" | "expense";
 
 function isTransferEntry(entry: Entry): boolean {
   return /^Transferencia (a|desde) /i.test(entry.comment);
 }
 
-function getProjectionMonthSlots(): Array<{ year: number; month: number }> {
+function getSuggestedProjectionMonthValue(months: IncomeProjectionMonth[]): string {
   const now = new Date();
-  return Array.from({ length: PROJECTION_MONTH_COUNT }, (_, i) => {
-    const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
-    return { year: d.getFullYear(), month: d.getMonth() + 1 };
-  });
+  if (months.length === 0) {
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  }
+  const sorted = [...months].sort((a, b) => (a.year !== b.year ? a.year - b.year : a.month - b.month));
+  const last = sorted[sorted.length - 1];
+  const next = new Date(last.year, last.month, 1);
+  return `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`;
 }
 
 const HOURLY_RATE_STORAGE_KEY = "balance-plus-hourly-rate";
@@ -452,10 +455,19 @@ export function App() {
   const [projectionBalanceInput, setProjectionBalanceInput] = useState("0");
   const [projectionMonths, setProjectionMonths] = useState<IncomeProjectionMonth[]>([]);
   const [projectionLines, setProjectionLines] = useState<IncomeProjectionLine[]>([]);
-  const [projectionLineForm, setProjectionLineForm] = useState({ description: "", amount: "" });
+  const [projectionLineForm, setProjectionLineForm] = useState({
+    description: "",
+    amount: "",
+    lineType: "income" as ProjectionLineType,
+  });
   const [projectionLineTarget, setProjectionLineTarget] = useState<{ year: number; month: number } | null>(null);
   const [editingProjectionLineId, setEditingProjectionLineId] = useState<string | null>(null);
   const [projectionLineError, setProjectionLineError] = useState<string | null>(null);
+  const [selectedProjectionMonthDetail, setSelectedProjectionMonthDetail] = useState<IncomeProjectionMonth | null>(null);
+  const [showAddProjectionMonthModal, setShowAddProjectionMonthModal] = useState(false);
+  const [addProjectionMonthInput, setAddProjectionMonthInput] = useState("");
+  const [addProjectionMonthError, setAddProjectionMonthError] = useState<string | null>(null);
+  const [confirmDeleteProjectionMonth, setConfirmDeleteProjectionMonth] = useState<IncomeProjectionMonth | null>(null);
   const [familyForm, setFamilyForm] = useState({
     name: "",
     totalAmount: "",
@@ -1141,10 +1153,14 @@ export function App() {
     setProjectionLineTarget({ year, month });
     if (line) {
       setEditingProjectionLineId(line.id);
-      setProjectionLineForm({ description: line.description, amount: String(line.amount) });
+      setProjectionLineForm({
+        description: line.description,
+        amount: String(Math.abs(line.amount)),
+        lineType: line.amount < 0 ? "expense" : "income",
+      });
     } else {
       setEditingProjectionLineId(null);
-      setProjectionLineForm({ description: "", amount: "" });
+      setProjectionLineForm({ description: "", amount: "", lineType: "income" });
     }
     setProjectionLineError(null);
   };
@@ -1152,8 +1168,67 @@ export function App() {
   const closeProjectionLineModal = () => {
     setProjectionLineTarget(null);
     setEditingProjectionLineId(null);
-    setProjectionLineForm({ description: "", amount: "" });
+    setProjectionLineForm({ description: "", amount: "", lineType: "income" });
     setProjectionLineError(null);
+  };
+
+  const openAddProjectionMonthModal = () => {
+    setAddProjectionMonthInput(getSuggestedProjectionMonthValue(projectionMonths));
+    setAddProjectionMonthError(null);
+    setShowAddProjectionMonthModal(true);
+  };
+
+  const closeAddProjectionMonthModal = () => {
+    setShowAddProjectionMonthModal(false);
+    setAddProjectionMonthInput("");
+    setAddProjectionMonthError(null);
+  };
+
+  const handleAddProjectionMonth = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!/^\d{4}-\d{2}$/.test(addProjectionMonthInput)) {
+      setAddProjectionMonthError("Selecciona un mes válido.");
+      return;
+    }
+    const [yearStr, monthStr] = addProjectionMonthInput.split("-");
+    const year = Number(yearStr);
+    const month = Number(monthStr);
+    if (month < 1 || month > 12) {
+      setAddProjectionMonthError("Selecciona un mes válido.");
+      return;
+    }
+    if (projectionMonths.some((m) => m.year === year && m.month === month)) {
+      setAddProjectionMonthError("Ese mes ya está en la proyección.");
+      return;
+    }
+    const monthId = await ensureProjectionMonthId(year, month);
+    if (!monthId) {
+      setAddProjectionMonthError("No se pudo agregar el mes.");
+      return;
+    }
+    closeAddProjectionMonthModal();
+  };
+
+  const closeProjectionMonthDetailModal = () => {
+    setSelectedProjectionMonthDetail(null);
+  };
+
+  const confirmDeleteProjectionMonthOk = async () => {
+    if (!confirmDeleteProjectionMonth) return;
+    const monthId = confirmDeleteProjectionMonth.id;
+    const { error } = await supabase.from("income_projection_months").delete().eq("id", monthId);
+    if (error) {
+      setConfirmDeleteProjectionMonth(null);
+      return;
+    }
+    setProjectionMonths((prev) => prev.filter((m) => m.id !== monthId));
+    setProjectionLines((prev) => prev.filter((l) => l.monthId !== monthId));
+    setConfirmDeleteProjectionMonth(null);
+    if (selectedProjectionMonthDetail?.id === monthId) setSelectedProjectionMonthDetail(null);
+  };
+
+  const confirmDeleteProjectionMonthCancel = () => {
+    setConfirmDeleteProjectionMonth(null);
   };
 
   const handleSubmitProjectionLine = async (event: React.FormEvent) => {
@@ -1161,15 +1236,17 @@ export function App() {
     if (!projectionLineTarget) return;
     const description = projectionLineForm.description.trim();
     const raw = projectionLineForm.amount.replace(/\s/g, "").replace(",", ".");
-    const amount = Number(raw);
+    const parsed = Number(raw);
     if (!description) {
       setProjectionLineError("Ingresa una descripción.");
       return;
     }
-    if (!raw || Number.isNaN(amount) || amount === 0) {
-      setProjectionLineError("Ingresa un monto distinto de 0 (positivo = ingreso, negativo = egreso).");
+    if (!raw || Number.isNaN(parsed) || parsed <= 0) {
+      setProjectionLineError("Ingresa un monto mayor a 0.");
       return;
     }
+    const amount =
+      projectionLineForm.lineType === "expense" ? -Math.abs(parsed) : Math.abs(parsed);
     const monthId = await ensureProjectionMonthId(projectionLineTarget.year, projectionLineTarget.month);
     if (!monthId) {
       setProjectionLineError("No se pudo guardar el mes.");
@@ -1802,18 +1879,27 @@ export function App() {
   }, [activeFamilyItems, familyInstallments]);
 
   const projectionData = useMemo(() => {
-    const slots = getProjectionMonthSlots();
+    const sorted = [...projectionMonths].sort((a, b) =>
+      a.year !== b.year ? a.year - b.year : a.month - b.month,
+    );
     let runningBalance = projectionStartingBalance;
-    return slots.map(({ year, month }) => {
-      const monthId = projectionMonths.find((m) => m.year === year && m.month === month)?.id ?? null;
-      const lines = monthId
-        ? projectionLines
-            .filter((l) => l.monthId === monthId)
-            .sort((a, b) => a.sortOrder - b.sortOrder)
-        : [];
+    return sorted.map((monthRow) => {
+      const openingBalance = runningBalance;
+      const lines = projectionLines
+        .filter((l) => l.monthId === monthRow.id)
+        .sort((a, b) => a.sortOrder - b.sortOrder);
       const monthDelta = lines.reduce((sum, l) => sum + l.amount, 0);
       runningBalance += monthDelta;
-      return { year, month, monthId, lines, monthDelta, endingBalance: runningBalance };
+      return {
+        id: monthRow.id,
+        year: monthRow.year,
+        month: monthRow.month,
+        monthId: monthRow.id,
+        lines,
+        monthDelta,
+        openingBalance,
+        endingBalance: runningBalance,
+      };
     });
   }, [projectionStartingBalance, projectionMonths, projectionLines]);
 
@@ -1830,7 +1916,10 @@ export function App() {
       !confirmDeleteFamilyItem &&
       !projectionLineTarget &&
       !selectedFamilyItemDetail &&
-      !confirmMarkInstallmentPaid
+      !confirmMarkInstallmentPaid &&
+      !selectedProjectionMonthDetail &&
+      !showAddProjectionMonthModal &&
+      !confirmDeleteProjectionMonth
     )
       return;
     const onKey = (e: KeyboardEvent) => {
@@ -1849,6 +1938,9 @@ export function App() {
         confirmMarkInstallmentPaidCancel();
         closeFamilyItemDetailModal();
         if (projectionLineTarget) closeProjectionLineModal();
+        closeProjectionMonthDetailModal();
+        closeAddProjectionMonthModal();
+        confirmDeleteProjectionMonthCancel();
         if (expandedChartModal) setExpandedChartModal(null);
         if (showCalendarModal) setShowCalendarModal(false);
       }
@@ -1868,6 +1960,9 @@ export function App() {
     projectionLineTarget,
     selectedFamilyItemDetail,
     confirmMarkInstallmentPaid,
+    selectedProjectionMonthDetail,
+    showAddProjectionMonthModal,
+    confirmDeleteProjectionMonth,
     expandedChartModal,
     showCalendarModal,
   ]);
@@ -2017,8 +2112,8 @@ export function App() {
               </span>
               <span className="reference-right">
                 {projectionData.length > 0
-                  ? `Saldo proyectado a ${MONTH_NAMES_ES_SHORT[projectionData[projectionData.length - 1].month - 1]} ${projectionData[projectionData.length - 1].year}: ${formatCurrency(projectionData[projectionData.length - 1].endingBalance)}`
-                  : "12 meses de proyección"}
+                  ? `Último mes: ${formatCurrency(projectionData[projectionData.length - 1].endingBalance)}`
+                  : "Agregá meses a tu proyección"}
               </span>
             </div>
           )}
@@ -2210,14 +2305,20 @@ export function App() {
 
         {activeView === "incomeProjections" && (
           <section className="panel panel-projection">
-            <div className="projection-header">
-              <div>
-                <h2 className="panel-title">Proyección de Ingresos</h2>
-                <p className="panel-sub-right">
-                  Planificá tus ingresos y egresos para los próximos {PROJECTION_MONTH_COUNT} meses.
-                </p>
+            <div className="projection-section-layout">
+              <div className="projection-section-header">
+                <div>
+                  <h2 className="panel-title">Proyección de Ingresos</h2>
+                  <p className="panel-sub-right">Planificá ingresos y gastos mes a mes.</p>
+                </div>
+                <div className="projection-section-header-actions">
+                  <button type="button" className="button goals-add-button" onClick={openAddProjectionMonthModal}>
+                    + Agregar mes
+                  </button>
+                </div>
               </div>
-              <div className="projection-balance-form">
+
+              <div className="projection-balance-card">
                 <label className="projection-balance-label" htmlFor="projection-starting-balance">
                   Saldo inicial
                 </label>
@@ -2239,93 +2340,61 @@ export function App() {
                   </button>
                 </div>
               </div>
-            </div>
 
-            <div className="projection-months">
-              {projectionData.map((monthRow, index) => {
-                const prevBalance =
-                  index === 0 ? projectionStartingBalance : projectionData[index - 1].endingBalance;
-                return (
-                  <article key={`${monthRow.year}-${monthRow.month}`} className="projection-month-card">
-                    <header className="projection-month-header">
-                      <div>
-                        <h3 className="projection-month-title">
-                          {MONTH_NAMES_ES[monthRow.month - 1]} {monthRow.year}
-                        </h3>
-                        <p className="projection-month-opening">
-                          Saldo al inicio: {formatCurrency(prevBalance)}
-                        </p>
-                      </div>
+              {projectionData.length === 0 ? (
+                <div className="goals-empty-state">
+                  <p className="goals-empty-title">Todavía no agregaste meses</p>
+                  <p className="goals-empty-sub">
+                    Usá &quot;+ Agregar mes&quot; para empezar a proyectar ingresos y gastos.
+                  </p>
+                </div>
+              ) : (
+                <ul className="tx-list-plain projection-section-list">
+                  {projectionData.map((monthRow) => (
+                    <li key={monthRow.id}>
                       <button
                         type="button"
-                        className="button button-secondary projection-add-line-btn"
-                        onClick={() => openProjectionLineModal(monthRow.year, monthRow.month)}
+                        className="projection-section-row"
+                        onClick={() =>
+                          setSelectedProjectionMonthDetail({
+                            id: monthRow.id,
+                            year: monthRow.year,
+                            month: monthRow.month,
+                          })
+                        }
                       >
-                        + Línea
+                        <div className="tx-list-body">
+                          <span className="tx-list-desc">
+                            {MONTH_NAMES_ES[monthRow.month - 1]} {monthRow.year}
+                          </span>
+                          <span className="tx-list-meta">
+                            Saldo inicio {formatCurrency(monthRow.openingBalance)} · {monthRow.lines.length} línea
+                            {monthRow.lines.length !== 1 ? "s" : ""}
+                          </span>
+                        </div>
+                        <div className="tx-list-right projection-section-row-right">
+                          <span
+                            className={`projection-section-delta ${
+                              monthRow.monthDelta >= 0
+                                ? "projection-line-amount--in"
+                                : "projection-line-amount--out"
+                            }`}
+                          >
+                            {monthRow.monthDelta >= 0 ? "+" : ""}
+                            {formatCurrency(monthRow.monthDelta)}
+                          </span>
+                          <span className="projection-section-ending">
+                            Acum. {formatCurrency(monthRow.endingBalance)}
+                          </span>
+                        </div>
+                        <span className="projection-section-row-chevron" aria-hidden>
+                          ›
+                        </span>
                       </button>
-                    </header>
-
-                    {monthRow.lines.length === 0 ? (
-                      <p className="projection-month-empty">Sin movimientos proyectados este mes.</p>
-                    ) : (
-                      <ul className="projection-lines-list">
-                        {monthRow.lines.map((line) => (
-                          <li key={line.id} className="projection-line-item">
-                            <span className="projection-line-desc">{line.description}</span>
-                            <span
-                              className={`projection-line-amount ${
-                                line.amount >= 0 ? "projection-line-amount--in" : "projection-line-amount--out"
-                              }`}
-                            >
-                              {line.amount >= 0 ? "+" : ""}
-                              {formatCurrency(line.amount)}
-                            </span>
-                            <div className="projection-line-actions">
-                              <button
-                                type="button"
-                                className="button button-secondary goal-card-btn goal-card-btn-icon"
-                                data-tooltip="Editar"
-                                onClick={() => openProjectionLineModal(monthRow.year, monthRow.month, line)}
-                                aria-label="Editar línea"
-                              >
-                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-                              </button>
-                              <button
-                                type="button"
-                                className="button button-secondary goal-card-btn goal-card-btn-icon"
-                                data-tooltip="Eliminar"
-                                onClick={() => void handleDeleteProjectionLine(line.id)}
-                                aria-label="Eliminar línea"
-                              >
-                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                              </button>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-
-                    <footer className="projection-month-footer">
-                      <span className="projection-month-delta">
-                        Variación del mes:{" "}
-                        <strong
-                          className={
-                            monthRow.monthDelta >= 0
-                              ? "projection-line-amount--in"
-                              : "projection-line-amount--out"
-                          }
-                        >
-                          {monthRow.monthDelta >= 0 ? "+" : ""}
-                          {formatCurrency(monthRow.monthDelta)}
-                        </strong>
-                      </span>
-                      <span className="projection-month-ending">
-                        Saldo acumulado: <strong>{formatCurrency(monthRow.endingBalance)}</strong>
-                      </span>
-                    </footer>
-                  </article>
-                );
-              })}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </section>
         )}
@@ -3103,7 +3172,7 @@ export function App() {
 
       {projectionLineTarget && (
         <div
-          className="modal-overlay"
+          className="modal-overlay modal-overlay--stacked"
           onClick={closeProjectionLineModal}
           role="dialog"
           aria-modal="true"
@@ -3113,10 +3182,41 @@ export function App() {
             <h2 id="modal-projection-line-title" className="modal-title">
               {editingProjectionLineId ? "Editar línea" : "Nueva línea"}
             </h2>
-            <p className="modal-body">
-              {MONTH_NAMES_ES[projectionLineTarget.month - 1]} {projectionLineTarget.year} — ingreso positivo, egreso negativo.
+            <p className="modal-body modal-projection-line-sub">
+              {MONTH_NAMES_ES[projectionLineTarget.month - 1]} {projectionLineTarget.year}
             </p>
             <form onSubmit={handleSubmitProjectionLine}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Tipo</label>
+                </div>
+                <div className="projection-line-type-toggle" role="group" aria-label="Tipo de movimiento">
+                  <button
+                    type="button"
+                    className={`projection-line-type-btn ${
+                      projectionLineForm.lineType === "income" ? "projection-line-type-btn--active projection-line-type-btn--income" : ""
+                    }`}
+                    onClick={() => {
+                      setProjectionLineForm((prev) => ({ ...prev, lineType: "income" }));
+                      setProjectionLineError(null);
+                    }}
+                  >
+                    Ingreso
+                  </button>
+                  <button
+                    type="button"
+                    className={`projection-line-type-btn ${
+                      projectionLineForm.lineType === "expense" ? "projection-line-type-btn--active projection-line-type-btn--expense" : ""
+                    }`}
+                    onClick={() => {
+                      setProjectionLineForm((prev) => ({ ...prev, lineType: "expense" }));
+                      setProjectionLineError(null);
+                    }}
+                  >
+                    Gasto
+                  </button>
+                </div>
+              </div>
               <div className="field">
                 <div className="field-label-row">
                   <label className="field-label">Descripción</label>
@@ -3135,13 +3235,12 @@ export function App() {
               <div className="field">
                 <div className="field-label-row">
                   <label className="field-label">Monto</label>
-                  <span className="field-hint">Positivo = ingreso · Negativo = egreso</span>
                 </div>
                 <input
                   type="text"
                   inputMode="decimal"
                   className="input"
-                  placeholder="3500 o -1200"
+                  placeholder="3500"
                   value={projectionLineForm.amount}
                   onChange={(e) => {
                     setProjectionLineForm((prev) => ({ ...prev, amount: e.target.value }));
@@ -3164,6 +3263,202 @@ export function App() {
           </div>
         </div>
       )}
+
+      {showAddProjectionMonthModal && (
+        <div
+          className="modal-overlay"
+          onClick={closeAddProjectionMonthModal}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-add-projection-month-title"
+        >
+          <div className="modal modal-projection-add-month" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-add-projection-month-title" className="modal-title">
+              Agregar mes
+            </h2>
+            <p className="modal-body">Elegí el mes que querés incluir en la proyección.</p>
+            <form onSubmit={handleAddProjectionMonth}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Mes</label>
+                </div>
+                <input
+                  type="month"
+                  className="input"
+                  value={addProjectionMonthInput}
+                  onChange={(e) => {
+                    setAddProjectionMonthInput(e.target.value);
+                    setAddProjectionMonthError(null);
+                  }}
+                />
+              </div>
+              {addProjectionMonthError && (
+                <div className="error-text goals-error-text">{addProjectionMonthError}</div>
+              )}
+              <div className="modal-actions">
+                <button type="button" className="button button-secondary" onClick={closeAddProjectionMonthModal}>
+                  Cancelar
+                </button>
+                <button type="submit" className="button">
+                  Agregar
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {confirmDeleteProjectionMonth && (
+        <div
+          className="modal-overlay modal-overlay--stacked"
+          onClick={confirmDeleteProjectionMonthCancel}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-delete-projection-month-title"
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-delete-projection-month-title" className="modal-title">
+              Eliminar mes
+            </h2>
+            <p className="modal-body">
+              ¿Eliminar {MONTH_NAMES_ES[confirmDeleteProjectionMonth.month - 1]}{" "}
+              {confirmDeleteProjectionMonth.year} y todas sus líneas?
+            </p>
+            <div className="modal-actions">
+              <button type="button" className="button button-secondary" onClick={confirmDeleteProjectionMonthCancel}>
+                Cancelar
+              </button>
+              <button type="button" className="button" onClick={() => void confirmDeleteProjectionMonthOk()}>
+                Eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedProjectionMonthDetail && (() => {
+        const monthRow = projectionData.find((row) => row.id === selectedProjectionMonthDetail.id);
+        if (!monthRow) return null;
+        return (
+          <div
+            className="modal-overlay"
+            onClick={closeProjectionMonthDetailModal}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="modal-projection-month-title"
+          >
+            <div className="modal modal-projection-month-detail" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-projection-month-detail-header">
+                <div>
+                  <h2 id="modal-projection-month-title" className="modal-title">
+                    {MONTH_NAMES_ES[monthRow.month - 1]} {monthRow.year}
+                  </h2>
+                  <p className="modal-projection-month-detail-sub">
+                    Saldo al inicio: {formatCurrency(monthRow.openingBalance)}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close-btn"
+                  onClick={closeProjectionMonthDetailModal}
+                  aria-label="Cerrar"
+                >
+                  ×
+                </button>
+              </div>
+
+              <div className="projection-month-detail-summary">
+                <span>
+                  Variación:{" "}
+                  <strong
+                    className={
+                      monthRow.monthDelta >= 0 ? "projection-line-amount--in" : "projection-line-amount--out"
+                    }
+                  >
+                    {monthRow.monthDelta >= 0 ? "+" : ""}
+                    {formatCurrency(monthRow.monthDelta)}
+                  </strong>
+                </span>
+                <span>
+                  Saldo acumulado: <strong>{formatCurrency(monthRow.endingBalance)}</strong>
+                </span>
+              </div>
+
+              {monthRow.lines.length === 0 ? (
+                <p className="projection-month-empty">Sin movimientos este mes.</p>
+              ) : (
+                <ul className="projection-lines-list projection-lines-list--detail">
+                  {monthRow.lines.map((line) => (
+                    <li key={line.id} className="projection-line-item">
+                      <div className="projection-line-item-main">
+                        <span className="projection-line-desc">{line.description}</span>
+                        <span
+                          className={`projection-line-type-chip ${
+                            line.amount >= 0 ? "projection-line-type-chip--income" : "projection-line-type-chip--expense"
+                          }`}
+                        >
+                          {line.amount >= 0 ? "Ingreso" : "Gasto"}
+                        </span>
+                      </div>
+                      <span
+                        className={`projection-line-amount ${
+                          line.amount >= 0 ? "projection-line-amount--in" : "projection-line-amount--out"
+                        }`}
+                      >
+                        {line.amount >= 0 ? "+" : ""}
+                        {formatCurrency(line.amount)}
+                      </span>
+                      <div className="projection-line-actions">
+                        <button
+                          type="button"
+                          className="button button-secondary goal-card-btn goal-card-btn-icon"
+                          data-tooltip="Editar"
+                          onClick={() => openProjectionLineModal(monthRow.year, monthRow.month, line)}
+                          aria-label="Editar línea"
+                        >
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="button button-secondary goal-card-btn goal-card-btn-icon"
+                          data-tooltip="Eliminar"
+                          onClick={() => void handleDeleteProjectionLine(line.id)}
+                          aria-label="Eliminar línea"
+                        >
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <div className="modal-actions modal-projection-month-detail-actions">
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() => openProjectionLineModal(monthRow.year, monthRow.month)}
+                >
+                  + Línea
+                </button>
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() =>
+                    setConfirmDeleteProjectionMonth({
+                      id: monthRow.id,
+                      year: monthRow.year,
+                      month: monthRow.month,
+                    })
+                  }
+                >
+                  Eliminar mes
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {(showSalaryForm || editingSalaryId) && (
         <div
