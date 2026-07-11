@@ -66,7 +66,21 @@ function daysUntil(d: Date): number {
   return Math.max(0, Math.ceil((target.getTime() - today.getTime()) / 86400000));
 }
 
-type ViewId = "dashboard" | "upcoming" | "goals" | "familyFinancing";
+type ViewId = "dashboard" | "upcoming" | "familyFinancing" | "incomeProjections";
+
+const PROJECTION_MONTH_COUNT = 12;
+
+function isTransferEntry(entry: Entry): boolean {
+  return /^Transferencia (a|desde) /i.test(entry.comment);
+}
+
+function getProjectionMonthSlots(): Array<{ year: number; month: number }> {
+  const now = new Date();
+  return Array.from({ length: PROJECTION_MONTH_COUNT }, (_, i) => {
+    const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+    return { year: d.getFullYear(), month: d.getMonth() + 1 };
+  });
+}
 
 const HOURLY_RATE_STORAGE_KEY = "balance-plus-hourly-rate";
 const DEFAULT_HOURLY_RATE = 33.5;
@@ -120,29 +134,21 @@ interface FormState {
   comment: string;
 }
 
-type SavingsGoalStatus = "in_progress" | "at_risk" | "completed";
-
-interface SavingsGoal {
-  id: string;
-  name: string;
-  targetAmount: number;
-  currentAmount: number;
-  deadline: string | null;
-  category: string;
-  status: SavingsGoalStatus;
-  createdAt: string;
-}
-
-interface SavingsContribution {
-  id: string;
-  goalId: string;
-  amount: number;
-  source: "manual" | "retention";
-  createdAt: string;
-  movementId?: number | null;
-}
-
 type FamilyFinancingStatus = "in_progress" | "completed";
+
+interface IncomeProjectionMonth {
+  id: string;
+  year: number;
+  month: number;
+}
+
+interface IncomeProjectionLine {
+  id: string;
+  monthId: string;
+  description: string;
+  amount: number;
+  sortOrder: number;
+}
 
 interface FamilyFinancingItem {
   id: string;
@@ -165,6 +171,51 @@ interface FamilyFinancingInstallment {
   isPaid: boolean;
   paidAt: string | null;
   createdAt: string;
+}
+
+type FamilyMonthSummaryStatus = "paid" | "pending" | "partial" | "empty";
+
+interface FamilyMonthSummary {
+  year: number;
+  month: number;
+  total: number;
+  paidCount: number;
+  count: number;
+  status: FamilyMonthSummaryStatus;
+  isCurrentMonth: boolean;
+}
+
+const FAMILY_DASHBOARD_FUTURE_MONTHS = 4;
+
+function familyMonthKey(year: number, month: number): number {
+  return year * 12 + month;
+}
+
+function summarizeFamilyMonthInstallments(
+  installments: FamilyFinancingInstallment[],
+  year: number,
+  month: number,
+): Pick<FamilyMonthSummary, "total" | "paidCount" | "count" | "status"> {
+  const monthInstallments = installments.filter((inst) => {
+    const [dueYear, dueMonth] = inst.dueDate.split("-").map(Number);
+    return dueYear === year && dueMonth === month;
+  });
+  const total = monthInstallments.reduce((sum, inst) => sum + inst.amount, 0);
+  const paidCount = monthInstallments.filter((inst) => inst.isPaid).length;
+  const count = monthInstallments.length;
+  let status: FamilyMonthSummaryStatus = "empty";
+  if (count === 0) status = "empty";
+  else if (paidCount === count) status = "paid";
+  else if (paidCount === 0) status = "pending";
+  else status = "partial";
+  return { total, paidCount, count, status };
+}
+
+function getFamilyMonthStatusLabel(row: Pick<FamilyMonthSummary, "status" | "paidCount" | "count">): string {
+  if (row.status === "paid") return "Pagado";
+  if (row.status === "pending") return "Pendiente";
+  if (row.status === "partial") return `Parcial · ${row.paidCount}/${row.count}`;
+  return "—";
 }
 
 function getDueDateForInstallment(purchaseDate: string, installmentNumber: number): string {
@@ -255,6 +306,47 @@ const formatCurrencyAxis = (value: number) =>
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
   });
+
+function computeInstallmentRedistribution(
+  item: FamilyFinancingItem,
+  allInstallments: FamilyFinancingInstallment[],
+  editedInstallmentId: string,
+  newAmount: number,
+): { updates: Array<{ id: string; amount: number }> } | { error: string } {
+  const installments = allInstallments
+    .filter((inst) => inst.itemId === item.id)
+    .sort((a, b) => a.installmentNumber - b.installmentNumber);
+  const edited = installments.find((inst) => inst.id === editedInstallmentId);
+  if (!edited) return { error: "Cuota no encontrada." };
+  if (edited.isPaid) return { error: "No se puede editar una cuota ya pagada." };
+
+  const paidTotal = installments.filter((inst) => inst.isPaid).reduce((sum, inst) => sum + inst.amount, 0);
+  const priorUnpaidTotal = installments
+    .filter((inst) => !inst.isPaid && inst.installmentNumber < edited.installmentNumber)
+    .reduce((sum, inst) => sum + inst.amount, 0);
+  const allocated = paidTotal + priorUnpaidTotal + newAmount;
+  const remaining = Math.round((item.totalAmount - allocated) * 100) / 100;
+
+  if (remaining < -0.001) {
+    const maxAmount = Math.round((item.totalAmount - paidTotal - priorUnpaidTotal) * 100) / 100;
+    return {
+      error: `El monto excede el total del item. Máximo para esta cuota: ${formatCurrency(maxAmount)}.`,
+    };
+  }
+
+  const subsequent = installments.filter(
+    (inst) => !inst.isPaid && inst.installmentNumber > edited.installmentNumber,
+  );
+  const subsequentAmounts =
+    subsequent.length > 0 ? splitIntoInstallments(Math.max(0, remaining), subsequent.length) : [];
+
+  return {
+    updates: [
+      { id: edited.id, amount: newAmount },
+      ...subsequent.map((inst, idx) => ({ id: inst.id, amount: subsequentAmounts[idx] })),
+    ],
+  };
+}
 
 const formatDisplayDate = (iso: string) => {
   if (!iso) return "";
@@ -354,10 +446,16 @@ export function App() {
   const [txDescription, setTxDescription] = useState("");
   const [txAmountError, setTxAmountError] = useState<string | null>(null);
 
-  const [savingsGoals, setSavingsGoals] = useState<SavingsGoal[]>([]);
-  const [savingsContributions, setSavingsContributions] = useState<SavingsContribution[]>([]);
   const [familyItems, setFamilyItems] = useState<FamilyFinancingItem[]>([]);
   const [familyInstallments, setFamilyInstallments] = useState<FamilyFinancingInstallment[]>([]);
+  const [projectionStartingBalance, setProjectionStartingBalance] = useState(0);
+  const [projectionBalanceInput, setProjectionBalanceInput] = useState("0");
+  const [projectionMonths, setProjectionMonths] = useState<IncomeProjectionMonth[]>([]);
+  const [projectionLines, setProjectionLines] = useState<IncomeProjectionLine[]>([]);
+  const [projectionLineForm, setProjectionLineForm] = useState({ description: "", amount: "" });
+  const [projectionLineTarget, setProjectionLineTarget] = useState<{ year: number; month: number } | null>(null);
+  const [editingProjectionLineId, setEditingProjectionLineId] = useState<string | null>(null);
+  const [projectionLineError, setProjectionLineError] = useState<string | null>(null);
   const [familyForm, setFamilyForm] = useState({
     name: "",
     totalAmount: "",
@@ -369,18 +467,11 @@ export function App() {
   const [editingFamilyItemId, setEditingFamilyItemId] = useState<string | null>(null);
   const [showFamilyModal, setShowFamilyModal] = useState(false);
   const [confirmDeleteFamilyItem, setConfirmDeleteFamilyItem] = useState<FamilyFinancingItem | null>(null);
+  const [selectedFamilyItemDetail, setSelectedFamilyItemDetail] = useState<FamilyFinancingItem | null>(null);
+  const [confirmMarkInstallmentPaid, setConfirmMarkInstallmentPaid] = useState<FamilyFinancingInstallment | null>(null);
   const [editingFamilyInstallment, setEditingFamilyInstallment] = useState<FamilyFinancingInstallment | null>(null);
   const [installmentEditForm, setInstallmentEditForm] = useState({ amount: "", dueMonth: "" });
   const [installmentEditError, setInstallmentEditError] = useState<string | null>(null);
-  const [goalForm, setGoalForm] = useState({ name: "", targetAmount: "", deadline: "", category: "" });
-  const [goalFormError, setGoalFormError] = useState<string | null>(null);
-  const [editingGoalId, setEditingGoalId] = useState<string | null>(null);
-  const [selectedGoalForContribution, setSelectedGoalForContribution] = useState<SavingsGoal | null>(null);
-  const [contributionAmount, setContributionAmount] = useState("");
-  const [contributionError, setContributionError] = useState<string | null>(null);
-  const [editingContribution, setEditingContribution] = useState<{ id: string; amount: number } | null>(null);
-  const [confirmResetGoal, setConfirmResetGoal] = useState<SavingsGoal | null>(null);
-  const [showGoalModal, setShowGoalModal] = useState(false);
   const [chartHoveredMonthIndex, setChartHoveredMonthIndex] = useState<number | null>(null);
   const [flowChartHovered, setFlowChartHovered] = useState<{ monthIndex: number; bar: "income" | "expense" } | null>(null);
   const [expandedChartModal, setExpandedChartModal] = useState<"monthly" | "flow" | null>(null);
@@ -390,12 +481,6 @@ export function App() {
     return { year: d.getFullYear(), month: d.getMonth() + 1 };
   });
   const [calendarHoveredDate, setCalendarHoveredDate] = useState<string | null>(null);
-  const goalsSliderRef = useRef<HTMLDivElement | null>(null);
-  const goalsDragRef = useRef({ startX: 0, startScrollLeft: 0 });
-  const familySliderRef = useRef<HTMLDivElement | null>(null);
-  const familyDragRef = useRef({ startX: 0, startScrollLeft: 0 });
-  const achievementsSliderRef = useRef<HTMLDivElement | null>(null);
-  const achievementsDragRef = useRef({ startX: 0, startScrollLeft: 0 });
   const upcomingDashboardSliderRef = useRef<HTMLDivElement | null>(null);
   const upcomingDashboardDragRef = useRef({ startX: 0, startScrollLeft: 0 });
 
@@ -408,10 +493,11 @@ export function App() {
           { data: placesData },
           { data: settingsData },
           { data: salaryRows },
-          { data: goalsRows },
-          { data: contributionsRows },
           { data: familyItemsRows },
           { data: familyInstallmentsRows },
+          { data: projectionSettings },
+          { data: projectionMonthsRows },
+          { data: projectionLinesRows },
         ] = await Promise.all([
           supabase
             .from("movements")
@@ -426,14 +512,6 @@ export function App() {
             .order("year", { ascending: true })
             .order("month", { ascending: true }),
           supabase
-            .from("savings_goals")
-            .select("id, name, target_amount, current_amount, deadline, category, status, created_at")
-            .order("created_at", { ascending: true }),
-          supabase
-            .from("savings_goal_contributions")
-            .select("id, goal_id, amount, source, created_at, movement_id")
-            .order("created_at", { ascending: true }),
-          supabase
             .from("family_financing_items")
             .select("id, name, total_amount, purchase_date, notes, installment_count, status, created_at, completed_at")
             .order("created_at", { ascending: false }),
@@ -441,6 +519,9 @@ export function App() {
             .from("family_financing_installments")
             .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
             .order("installment_number", { ascending: true }),
+          supabase.from("income_projection_settings").select("starting_balance").eq("id", 1).maybeSingle(),
+          supabase.from("income_projection_months").select("id, year, month").order("year", { ascending: true }).order("month", { ascending: true }),
+          supabase.from("income_projection_lines").select("id, month_id, description, amount, sort_order").order("sort_order", { ascending: true }),
         ]);
 
         if (movements) {
@@ -476,30 +557,32 @@ export function App() {
           );
         }
 
-        if (goalsRows && Array.isArray(goalsRows)) {
-          setSavingsGoals(
-            goalsRows.map((g: { id: string; name: string; target_amount: number; current_amount: number; deadline: string | null; category: string; status: string; created_at: string }) => ({
-              id: String(g.id),
-              name: g.name,
-              targetAmount: Number(g.target_amount),
-              currentAmount: Number(g.current_amount),
-              deadline: g.deadline,
-              category: g.category,
-              status: (g.status as SavingsGoalStatus) ?? "in_progress",
-              createdAt: g.created_at,
+        if (projectionSettings && typeof projectionSettings.starting_balance !== "undefined") {
+          const balance = Number(projectionSettings.starting_balance);
+          if (!Number.isNaN(balance)) {
+            setProjectionStartingBalance(balance);
+            setProjectionBalanceInput(String(balance));
+          }
+        }
+
+        if (projectionMonthsRows && Array.isArray(projectionMonthsRows)) {
+          setProjectionMonths(
+            projectionMonthsRows.map((row: { id: string; year: number; month: number }) => ({
+              id: String(row.id),
+              year: Number(row.year),
+              month: Number(row.month),
             })),
           );
         }
 
-        if (contributionsRows && Array.isArray(contributionsRows)) {
-          setSavingsContributions(
-            contributionsRows.map((c: { id: string; goal_id: string; amount: number; source: string; created_at: string; movement_id?: number | null }) => ({
-              id: String(c.id),
-              goalId: String(c.goal_id),
-              amount: Number(c.amount),
-              source: c.source === "retention" ? "retention" : "manual",
-              createdAt: c.created_at,
-              movementId: typeof c.movement_id === "number" ? c.movement_id : c.movement_id ?? null,
+        if (projectionLinesRows && Array.isArray(projectionLinesRows)) {
+          setProjectionLines(
+            projectionLinesRows.map((row: { id: string; month_id: string; description: string; amount: number; sort_order: number }) => ({
+              id: String(row.id),
+              monthId: String(row.month_id),
+              description: row.description,
+              amount: Number(row.amount),
+              sortOrder: Number(row.sort_order),
             })),
           );
         }
@@ -823,6 +906,7 @@ export function App() {
       let expense = 0;
       for (const e of filtered) {
         if (!e.date.startsWith(prefix)) continue;
+        if (isTransferEntry(e)) continue;
         if (e.amount > 0) income += e.amount;
         else expense += Math.abs(e.amount);
       }
@@ -835,14 +919,13 @@ export function App() {
   /** En el Dashboard mostramos más salarios para poder hacer scroll horizontal (Junio, Julio, etc.) */
   const upcomingSalaries = useMemo(() => getUpcomingFromEntries(salaryEntries, 12), [salaryEntries]);
 
-  /** Actividades por fecha para el calendario (transacciones, cobros de salario, metas con fecha límite) */
+  /** Actividades por fecha para el calendario (transacciones y cobros de salario) */
   const calendarActivitiesByDate = useMemo(() => {
     const map: Record<
       string,
       {
         transactions: Entry[];
         salaries: Array<{ date: Date; amount: number; month: number; year: number; id: string }>;
-        goals: Array<{ name: string; deadline: string }>;
       }
     > = {};
     const toYmd = (d: Date) => {
@@ -852,13 +935,13 @@ export function App() {
       return `${y}-${String(m).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
     };
     entries.forEach((e) => {
-      if (!map[e.date]) map[e.date] = { transactions: [], salaries: [], goals: [] };
+      if (!map[e.date]) map[e.date] = { transactions: [], salaries: [] };
       map[e.date].transactions.push(e);
     });
     salaryEntries.forEach((e) => {
       const date = getLastBusinessDay(e.year, e.month);
       const key = toYmd(date);
-      if (!map[key]) map[key] = { transactions: [], salaries: [], goals: [] };
+      if (!map[key]) map[key] = { transactions: [], salaries: [] };
       map[key].salaries.push({
         date,
         amount: e.hours * e.hourlyRate,
@@ -867,13 +950,8 @@ export function App() {
         id: e.id,
       });
     });
-    savingsGoals.forEach((g) => {
-      if (!g.deadline) return;
-      if (!map[g.deadline]) map[g.deadline] = { transactions: [], salaries: [], goals: [] };
-      map[g.deadline].goals.push({ name: g.name, deadline: g.deadline });
-    });
     return map;
-  }, [entries, salaryEntries, savingsGoals]);
+  }, [entries, salaryEntries]);
 
   /** Totalizadores por año (ingresos a la fecha vs proyectados resto del año) */
   const salaryTotalsByYear = useMemo(() => {
@@ -1027,327 +1105,133 @@ export function App() {
     setConfirmDeleteSalary(null);
   };
 
-  const handleGoalFieldChange =
-    (field: "name" | "targetAmount" | "deadline" | "category") =>
-    (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-      const value = event.target.value;
-      setGoalForm((prev) => ({ ...prev, [field]: value }));
-      setGoalFormError(null);
+  const ensureProjectionMonthId = async (year: number, month: number): Promise<string | null> => {
+    const existing = projectionMonths.find((m) => m.year === year && m.month === month);
+    if (existing) return existing.id;
+    const { data, error } = await supabase
+      .from("income_projection_months")
+      .insert({ year, month })
+      .select("id, year, month")
+      .single();
+    if (error || !data) return null;
+    const row = data as { id: string; year: number; month: number };
+    const newMonth: IncomeProjectionMonth = {
+      id: String(row.id),
+      year: Number(row.year),
+      month: Number(row.month),
     };
-
-  const resetGoalForm = () => {
-    setGoalForm({ name: "", targetAmount: "", deadline: "", category: "" });
-    setGoalFormError(null);
-    setEditingGoalId(null);
-  };
-
-  const handleSubmitGoal = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const name = goalForm.name.trim();
-    const category = goalForm.category.trim();
-    const target = Number(goalForm.targetAmount.replace(/\s/g, "").replace(",", "."));
-
-    if (!name) {
-      setGoalFormError("Ingresa un nombre para la meta.");
-      return;
-    }
-    if (!category) {
-      setGoalFormError("Ingresa una categoría para la meta.");
-      return;
-    }
-    if (!goalForm.targetAmount || Number.isNaN(target) || target <= 0) {
-      setGoalFormError("Ingresa un monto objetivo mayor a 0.");
-      return;
-    }
-
-    let deadline: string | null = null;
-    if (goalForm.deadline) {
-      const isValidDate = /^\d{4}-\d{2}-\d{2}$/.test(goalForm.deadline);
-      if (!isValidDate) {
-        setGoalFormError("La fecha límite debe tener formato YYYY-MM-DD.");
-        return;
-      }
-      deadline = goalForm.deadline;
-    }
-
-    if (editingGoalId) {
-      const { error } = await supabase
-        .from("savings_goals")
-        .update({
-          name,
-          category,
-          target_amount: target,
-          deadline,
-        })
-        .eq("id", editingGoalId);
-      if (error) {
-        setGoalFormError(error.message || "No se pudo actualizar la meta.");
-        return;
-      }
-      setSavingsGoals((prev) =>
-        prev.map((g) =>
-          g.id === editingGoalId ? { ...g, name, category, targetAmount: target, deadline } : g,
-        ),
-      );
-    } else {
-      const { data, error } = await supabase
-        .from("savings_goals")
-        .insert({
-          name,
-          category,
-          target_amount: target,
-          current_amount: 0,
-          deadline,
-          status: "in_progress",
-        })
-        .select("id, name, target_amount, current_amount, deadline, category, status, created_at")
-        .single();
-      if (error) {
-        setGoalFormError(error.message || "No se pudo crear la meta.");
-        return;
-      }
-      const row = data as {
-        id: string;
-        name: string;
-        target_amount: number;
-        current_amount: number;
-        deadline: string | null;
-        category: string;
-        status: string;
-        created_at: string;
-      };
-      const newGoal: SavingsGoal = {
-        id: String(row.id),
-        name: row.name,
-        category: row.category,
-        targetAmount: Number(row.target_amount),
-        currentAmount: Number(row.current_amount),
-        deadline: row.deadline,
-        status: (row.status as SavingsGoalStatus) ?? "in_progress",
-        createdAt: row.created_at,
-      };
-      setSavingsGoals((prev) => [newGoal, ...prev]);
-    }
-
-    resetGoalForm();
-    setShowGoalModal(false);
-  };
-
-  const startEditGoal = (goal: SavingsGoal) => {
-    setEditingGoalId(goal.id);
-    setGoalForm({
-      name: goal.name,
-      targetAmount: String(goal.targetAmount),
-      deadline: goal.deadline ?? "",
-      category: goal.category,
-    });
-    setGoalFormError(null);
-    setShowGoalModal(true);
-  };
-
-  const recalcGoalStatus = (goal: SavingsGoal): SavingsGoalStatus => {
-    if (goal.currentAmount >= goal.targetAmount && goal.targetAmount > 0) {
-      return "completed";
-    }
-    return "in_progress";
-  };
-
-  const markGoalCompleted = async (id: string) => {
-    const goal = savingsGoals.find((g) => g.id === id);
-    if (!goal) return;
-    const { error } = await supabase
-      .from("savings_goals")
-      .update({ current_amount: goal.targetAmount, status: "completed" })
-      .eq("id", id);
-    if (error) return;
-    setSavingsGoals((prev) =>
-      prev.map((g) =>
-        g.id === id
-          ? {
-              ...g,
-              currentAmount: g.targetAmount,
-              status: "completed",
-            }
-          : g,
-      ),
+    setProjectionMonths((prev) =>
+      [...prev, newMonth].sort((a, b) => (a.year !== b.year ? a.year - b.year : a.month - b.month)),
     );
+    return newMonth.id;
   };
 
-  const handleSubmitContribution = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!selectedGoalForContribution) return;
-
-    const raw = contributionAmount.replace(/\s/g, "").replace(",", ".");
+  const handleSaveProjectionBalance = async () => {
+    const raw = projectionBalanceInput.replace(/\s/g, "").replace(",", ".");
     const parsed = Number(raw);
+    if (Number.isNaN(parsed)) return;
+    const { error } = await supabase
+      .from("income_projection_settings")
+      .upsert({ id: 1, starting_balance: parsed }, { onConflict: "id" });
+    if (error) return;
+    setProjectionStartingBalance(parsed);
+  };
 
-    if (!raw || Number.isNaN(parsed) || parsed <= 0) {
-      setContributionError("Ingresa un monto válido mayor a 0.");
+  const openProjectionLineModal = (year: number, month: number, line?: IncomeProjectionLine) => {
+    setProjectionLineTarget({ year, month });
+    if (line) {
+      setEditingProjectionLineId(line.id);
+      setProjectionLineForm({ description: line.description, amount: String(line.amount) });
+    } else {
+      setEditingProjectionLineId(null);
+      setProjectionLineForm({ description: "", amount: "" });
+    }
+    setProjectionLineError(null);
+  };
+
+  const closeProjectionLineModal = () => {
+    setProjectionLineTarget(null);
+    setEditingProjectionLineId(null);
+    setProjectionLineForm({ description: "", amount: "" });
+    setProjectionLineError(null);
+  };
+
+  const handleSubmitProjectionLine = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!projectionLineTarget) return;
+    const description = projectionLineForm.description.trim();
+    const raw = projectionLineForm.amount.replace(/\s/g, "").replace(",", ".");
+    const amount = Number(raw);
+    if (!description) {
+      setProjectionLineError("Ingresa una descripción.");
       return;
     }
-
-    const goalId = selectedGoalForContribution.id;
-
-    if (editingContribution) {
-      // Editar un aporte manual existente
-      const { id: contribId, amount: originalAmount } = editingContribution;
+    if (!raw || Number.isNaN(amount) || amount === 0) {
+      setProjectionLineError("Ingresa un monto distinto de 0 (positivo = ingreso, negativo = egreso).");
+      return;
+    }
+    const monthId = await ensureProjectionMonthId(projectionLineTarget.year, projectionLineTarget.month);
+    if (!monthId) {
+      setProjectionLineError("No se pudo guardar el mes.");
+      return;
+    }
+    if (editingProjectionLineId) {
       const { data, error } = await supabase
-        .from("savings_goal_contributions")
-        .update({ amount: parsed })
-        .eq("id", contribId)
-        .select("id, goal_id, amount, source, created_at, movement_id")
+        .from("income_projection_lines")
+        .update({ description, amount })
+        .eq("id", editingProjectionLineId)
+        .select("id, month_id, description, amount, sort_order")
         .single();
       if (error) {
-        setContributionError(error.message || "No se pudo actualizar el aporte.");
+        setProjectionLineError(error.message || "No se pudo actualizar la línea.");
         return;
       }
-      const contribRow = data as {
-        id: string;
-        goal_id: string;
-        amount: number;
-        source: string;
-        created_at: string;
-        movement_id?: number | null;
-      };
-
-      const delta = parsed - originalAmount;
-
-      setSavingsContributions((prev) =>
-        prev.map((c) =>
-          c.id === contribId
+      const row = data as { id: string; month_id: string; description: string; amount: number; sort_order: number };
+      setProjectionLines((prev) =>
+        prev.map((l) =>
+          l.id === editingProjectionLineId
             ? {
-                id: String(contribRow.id),
-                goalId: String(contribRow.goal_id),
-                amount: Number(contribRow.amount),
-                source: contribRow.source === "retention" ? "retention" : "manual",
-                createdAt: contribRow.created_at,
-                movementId: typeof contribRow.movement_id === "number" ? contribRow.movement_id : contribRow.movement_id ?? null,
+                id: String(row.id),
+                monthId: String(row.month_id),
+                description: row.description,
+                amount: Number(row.amount),
+                sortOrder: Number(row.sort_order),
               }
-            : c,
+            : l,
         ),
       );
-
-      const updatedGoal = savingsGoals.find((g) => g.id === goalId);
-      if (updatedGoal && delta !== 0) {
-        const newCurrent = updatedGoal.currentAmount + delta;
-        const withUpdated: SavingsGoal = {
-          ...updatedGoal,
-          currentAmount: newCurrent,
-        };
-        const newStatus = recalcGoalStatus(withUpdated);
-        await supabase
-          .from("savings_goals")
-          .update({ current_amount: newCurrent, status: newStatus })
-          .eq("id", goalId);
-        setSavingsGoals((prev) =>
-          prev.map((g) =>
-            g.id === goalId
-              ? {
-                  ...g,
-                  currentAmount: newCurrent,
-                  status: newStatus,
-                }
-              : g,
-          ),
-        );
-      }
     } else {
-      // Crear un nuevo aporte manual
+      const existingLines = projectionLines.filter((l) => l.monthId === monthId);
+      const sortOrder =
+        existingLines.length > 0 ? Math.max(...existingLines.map((l) => l.sortOrder)) + 1 : 0;
       const { data, error } = await supabase
-        .from("savings_goal_contributions")
-        .insert({
-          goal_id: goalId,
-          amount: parsed,
-          source: "manual",
-        })
-        .select("id, goal_id, amount, source, created_at, movement_id")
+        .from("income_projection_lines")
+        .insert({ month_id: monthId, description, amount, sort_order: sortOrder })
+        .select("id, month_id, description, amount, sort_order")
         .single();
       if (error) {
-        setContributionError(error.message || "No se pudo registrar el aporte.");
+        setProjectionLineError(error.message || "No se pudo crear la línea.");
         return;
       }
-
-      const contribRow = data as {
-        id: string;
-        goal_id: string;
-        amount: number;
-        source: string;
-        created_at: string;
-        movement_id?: number | null;
-      };
-
-      setSavingsContributions((prev) => [
+      const row = data as { id: string; month_id: string; description: string; amount: number; sort_order: number };
+      setProjectionLines((prev) => [
         ...prev,
         {
-          id: String(contribRow.id),
-          goalId: String(contribRow.goal_id),
-          amount: Number(contribRow.amount),
-          source: contribRow.source === "retention" ? "retention" : "manual",
-          createdAt: contribRow.created_at,
-          movementId: typeof contribRow.movement_id === "number" ? contribRow.movement_id : contribRow.movement_id ?? null,
+          id: String(row.id),
+          monthId: String(row.month_id),
+          description: row.description,
+          amount: Number(row.amount),
+          sortOrder: Number(row.sort_order),
         },
       ]);
-
-      const updatedGoal = savingsGoals.find((g) => g.id === goalId);
-      if (updatedGoal) {
-        const newCurrent = updatedGoal.currentAmount + parsed;
-        const withUpdated: SavingsGoal = {
-          ...updatedGoal,
-          currentAmount: newCurrent,
-        };
-        const newStatus = recalcGoalStatus(withUpdated);
-        await supabase
-          .from("savings_goals")
-          .update({ current_amount: newCurrent, status: newStatus })
-          .eq("id", goalId);
-        setSavingsGoals((prev) =>
-          prev.map((g) =>
-            g.id === goalId
-              ? {
-                  ...g,
-                  currentAmount: newCurrent,
-                  status: newStatus,
-                }
-              : g,
-          ),
-        );
-      }
     }
-
-    setContributionAmount("");
-    setContributionError(null);
-    setEditingContribution(null);
-    setSelectedGoalForContribution(null);
+    closeProjectionLineModal();
   };
 
-  const handleResetGoalProgress = async () => {
-    if (!confirmResetGoal) return;
-    const goalId = confirmResetGoal.id;
-    const { error } = await supabase
-      .from("savings_goals")
-      .update({ current_amount: 0, status: "in_progress" })
-      .eq("id", goalId);
-    if (error) {
-      return;
-    }
-    setSavingsGoals((prev) =>
-      prev.map((g) =>
-        g.id === goalId
-          ? {
-              ...g,
-              currentAmount: 0,
-              status: "in_progress",
-            }
-          : g,
-      ),
-    );
-    setConfirmResetGoal(null);
-  };
-
-  const closeContributionModal = () => {
-    setSelectedGoalForContribution(null);
-    setContributionAmount("");
-    setContributionError(null);
-    setEditingContribution(null);
+  const handleDeleteProjectionLine = async (lineId: string) => {
+    const { error } = await supabase.from("income_projection_lines").delete().eq("id", lineId);
+    if (error) return;
+    setProjectionLines((prev) => prev.filter((l) => l.id !== lineId));
   };
 
   const getFamilyItemInstallments = (itemId: string) =>
@@ -1674,10 +1558,12 @@ export function App() {
     setShowFamilyModal(true);
   };
 
-  const toggleFamilyInstallmentPaid = async (installment: FamilyFinancingInstallment) => {
+  const applyFamilyInstallmentPaidState = async (
+    installment: FamilyFinancingInstallment,
+    newPaid: boolean,
+  ) => {
     const item = familyItems.find((row) => row.id === installment.itemId);
     if (!item) return;
-    const newPaid = !installment.isPaid;
     const paidAt = newPaid ? new Date().toISOString() : null;
     const { data, error } = await supabase
       .from("family_financing_installments")
@@ -1709,7 +1595,27 @@ export function App() {
     await updateFamilyItemStatus(item, nextInstallments);
   };
 
+  const handleFamilyInstallmentPaidToggle = (installment: FamilyFinancingInstallment) => {
+    if (installment.isPaid) {
+      void applyFamilyInstallmentPaidState(installment, false);
+      return;
+    }
+    setConfirmMarkInstallmentPaid(installment);
+  };
+
+  const confirmMarkInstallmentPaidOk = async () => {
+    if (!confirmMarkInstallmentPaid) return;
+    const installment = confirmMarkInstallmentPaid;
+    setConfirmMarkInstallmentPaid(null);
+    await applyFamilyInstallmentPaidState(installment, true);
+  };
+
+  const confirmMarkInstallmentPaidCancel = () => {
+    setConfirmMarkInstallmentPaid(null);
+  };
+
   const startEditFamilyInstallment = (installment: FamilyFinancingInstallment) => {
+    if (installment.isPaid) return;
     setEditingFamilyInstallment(installment);
     setInstallmentEditForm({
       amount: String(installment.amount),
@@ -1729,6 +1635,10 @@ export function App() {
     if (!editingFamilyInstallment) return;
     const item = familyItems.find((row) => row.id === editingFamilyInstallment.itemId);
     if (!item) return;
+    if (editingFamilyInstallment.isPaid) {
+      setInstallmentEditError("No se puede editar una cuota ya pagada.");
+      return;
+    }
 
     const parsedAmount = Number(installmentEditForm.amount.replace(/\s/g, "").replace(",", "."));
     if (!installmentEditForm.amount || Number.isNaN(parsedAmount) || parsedAmount <= 0) {
@@ -1740,35 +1650,76 @@ export function App() {
       return;
     }
 
-    const dueDate = `${installmentEditForm.dueMonth}-01`;
-    const { data, error } = await supabase
-      .from("family_financing_installments")
-      .update({ amount: parsedAmount, due_date: dueDate })
-      .eq("id", editingFamilyInstallment.id)
-      .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
-      .single();
-    if (error || !data) {
-      setInstallmentEditError(error?.message || "No se pudo actualizar la cuota.");
+    const redistribution = computeInstallmentRedistribution(
+      item,
+      familyInstallments,
+      editingFamilyInstallment.id,
+      parsedAmount,
+    );
+    if ("error" in redistribution) {
+      setInstallmentEditError(redistribution.error);
       return;
     }
 
-    const updatedInstallment = mapRowToFamilyInstallment(
-      data as {
-        id: string;
-        item_id: string;
-        installment_number: number;
-        amount: number;
-        due_date?: string | null;
-        is_paid: boolean;
-        paid_at: string | null;
-        created_at: string;
-      },
-      item.purchaseDate,
+    const dueDate = `${installmentEditForm.dueMonth}-01`;
+    const amountById = new Map(redistribution.updates.map((row) => [row.id, row.amount]));
+
+    const updateResults = await Promise.all(
+      redistribution.updates.map(async (row) => {
+        const payload =
+          row.id === editingFamilyInstallment.id
+            ? { amount: row.amount, due_date: dueDate }
+            : { amount: row.amount };
+        const { data, error } = await supabase
+          .from("family_financing_installments")
+          .update(payload)
+          .eq("id", row.id)
+          .select("id, item_id, installment_number, amount, due_date, is_paid, paid_at, created_at")
+          .single();
+        return { data, error, id: row.id };
+      }),
     );
+
+    const failed = updateResults.find((result) => result.error || !result.data);
+    if (failed) {
+      setInstallmentEditError(failed.error?.message || "No se pudieron actualizar las cuotas.");
+      return;
+    }
+
+    const updatedById = new Map(
+      updateResults.map((result) => [
+        result.id,
+        mapRowToFamilyInstallment(
+          result.data as {
+            id: string;
+            item_id: string;
+            installment_number: number;
+            amount: number;
+            due_date?: string | null;
+            is_paid: boolean;
+            paid_at: string | null;
+            created_at: string;
+          },
+          item.purchaseDate,
+        ),
+      ]),
+    );
+
     setFamilyInstallments((prev) =>
-      prev.map((row) => (row.id === editingFamilyInstallment.id ? updatedInstallment : row)),
+      prev.map((row) => {
+        const updated = updatedById.get(row.id);
+        if (updated) return updated;
+        if (amountById.has(row.id)) {
+          return { ...row, amount: amountById.get(row.id)! };
+        }
+        return row;
+      }),
     );
     closeFamilyInstallmentModal();
+  };
+
+  const closeFamilyItemDetailModal = () => {
+    setSelectedFamilyItemDetail(null);
   };
 
   const confirmDeleteFamilyItemOk = async () => {
@@ -1782,42 +1733,12 @@ export function App() {
     setFamilyItems((prev) => prev.filter((item) => item.id !== id));
     setFamilyInstallments((prev) => prev.filter((row) => row.itemId !== id));
     setConfirmDeleteFamilyItem(null);
+    if (selectedFamilyItemDetail?.id === id) setSelectedFamilyItemDetail(null);
   };
 
   const confirmDeleteFamilyItemCancel = () => {
     setConfirmDeleteFamilyItem(null);
   };
-
-  const getGoalProgressPct = (goal: SavingsGoal) => {
-    if (!goal.targetAmount || goal.targetAmount <= 0) return 0;
-    return Math.min(100, (goal.currentAmount / goal.targetAmount) * 100);
-  };
-
-  const getGoalRemainingAmount = (goal: SavingsGoal) =>
-    Math.max(0, goal.targetAmount - goal.currentAmount);
-
-  const getGoalDaysLeft = (goal: SavingsGoal) => {
-    if (!goal.deadline) return null;
-    const [year, month, day] = goal.deadline.split("-");
-    const d = new Date(Number(year), Number(month) - 1, Number(day));
-    return daysUntil(d);
-  };
-
-  const activeGoals = useMemo(
-    () =>
-      savingsGoals
-        .filter((g) => g.status !== "completed")
-        .sort((a, b) => {
-          const da = getGoalDaysLeft(a) ?? Number.POSITIVE_INFINITY;
-          const db = getGoalDaysLeft(b) ?? Number.POSITIVE_INFINITY;
-          return da - db;
-        }),
-    [savingsGoals],
-  );
-  const completedGoals = useMemo(
-    () => savingsGoals.filter((g) => g.status === "completed"),
-    [savingsGoals],
-  );
 
   const activeFamilyItems = useMemo(
     () => familyItems.filter((item) => item.status !== "completed"),
@@ -1838,20 +1759,63 @@ export function App() {
     const now = new Date();
     const year = now.getFullYear();
     const month = now.getMonth() + 1;
-    const monthInstallments = familyInstallments.filter((inst) => {
-      const [dueYear, dueMonth] = inst.dueDate.split("-").map(Number);
-      return dueYear === year && dueMonth === month;
-    });
-    const total = monthInstallments.reduce((sum, inst) => sum + inst.amount, 0);
-    const paidCount = monthInstallments.filter((inst) => inst.isPaid).length;
-    const count = monthInstallments.length;
-    let status: "paid" | "pending" | "partial" | "empty" = "empty";
-    if (count === 0) status = "empty";
-    else if (paidCount === count) status = "paid";
-    else if (paidCount === 0) status = "pending";
-    else status = "partial";
-    return { year, month, total, paidCount, count, status };
+    return { year, month, ...summarizeFamilyMonthInstallments(familyInstallments, year, month) };
   }, [familyInstallments]);
+
+  const familyDashboardMonths = useMemo((): FamilyMonthSummary[] => {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1;
+    const currentKey = familyMonthKey(currentYear, currentMonth);
+
+    const activeItemIds = new Set(activeFamilyItems.map((item) => item.id));
+    const activeInstallments = familyInstallments.filter((inst) => activeItemIds.has(inst.itemId));
+
+    const futureByKey = new Map<number, { year: number; month: number }>();
+    for (const inst of activeInstallments) {
+      const [dueYear, dueMonth] = inst.dueDate.split("-").map(Number);
+      const key = familyMonthKey(dueYear, dueMonth);
+      if (key > currentKey) futureByKey.set(key, { year: dueYear, month: dueMonth });
+    }
+
+    const futureMonths = Array.from(futureByKey.values())
+      .sort((a, b) => familyMonthKey(a.year, a.month) - familyMonthKey(b.year, b.month))
+      .slice(0, FAMILY_DASHBOARD_FUTURE_MONTHS);
+
+    const rows: FamilyMonthSummary[] = [
+      {
+        year: currentYear,
+        month: currentMonth,
+        isCurrentMonth: true,
+        ...summarizeFamilyMonthInstallments(activeInstallments, currentYear, currentMonth),
+      },
+    ];
+
+    for (const { year, month } of futureMonths) {
+      const summary = summarizeFamilyMonthInstallments(activeInstallments, year, month);
+      if (summary.count > 0) {
+        rows.push({ year, month, isCurrentMonth: false, ...summary });
+      }
+    }
+
+    return rows;
+  }, [activeFamilyItems, familyInstallments]);
+
+  const projectionData = useMemo(() => {
+    const slots = getProjectionMonthSlots();
+    let runningBalance = projectionStartingBalance;
+    return slots.map(({ year, month }) => {
+      const monthId = projectionMonths.find((m) => m.year === year && m.month === month)?.id ?? null;
+      const lines = monthId
+        ? projectionLines
+            .filter((l) => l.monthId === monthId)
+            .sort((a, b) => a.sortOrder - b.sortOrder)
+        : [];
+      const monthDelta = lines.reduce((sum, l) => sum + l.amount, 0);
+      runningBalance += monthDelta;
+      return { year, month, monthId, lines, monthDelta, endingBalance: runningBalance };
+    });
+  }, [projectionStartingBalance, projectionMonths, projectionLines]);
 
   useEffect(() => {
     if (
@@ -1861,11 +1825,12 @@ export function App() {
       !showAllTxModal &&
       !showSalaryForm &&
       !editingSalaryId &&
-      !showGoalModal &&
       !showFamilyModal &&
       !editingFamilyInstallment &&
       !confirmDeleteFamilyItem &&
-      !selectedGoalForContribution
+      !projectionLineTarget &&
+      !selectedFamilyItemDetail &&
+      !confirmMarkInstallmentPaid
     )
       return;
     const onKey = (e: KeyboardEvent) => {
@@ -1875,19 +1840,15 @@ export function App() {
         closeNewTxModal();
         setShowAllTxModal(false);
         if (showSalaryForm || editingSalaryId) cancelEditSalary();
-        if (showGoalModal) {
-          setShowGoalModal(false);
-          resetGoalForm();
-        }
         if (showFamilyModal) {
           setShowFamilyModal(false);
           resetFamilyForm();
         }
         closeFamilyInstallmentModal();
         confirmDeleteFamilyItemCancel();
-        if (selectedGoalForContribution) {
-          closeContributionModal();
-        }
+        confirmMarkInstallmentPaidCancel();
+        closeFamilyItemDetailModal();
+        if (projectionLineTarget) closeProjectionLineModal();
         if (expandedChartModal) setExpandedChartModal(null);
         if (showCalendarModal) setShowCalendarModal(false);
       }
@@ -1901,11 +1862,12 @@ export function App() {
     showAllTxModal,
     showSalaryForm,
     editingSalaryId,
-    showGoalModal,
     showFamilyModal,
     editingFamilyInstallment,
     confirmDeleteFamilyItem,
-    selectedGoalForContribution,
+    projectionLineTarget,
+    selectedFamilyItemDetail,
+    confirmMarkInstallmentPaid,
     expandedChartModal,
     showCalendarModal,
   ]);
@@ -1958,13 +1920,13 @@ export function App() {
             </a>
             <a
               href="#"
-              className={`sidebar-nav-item ${activeView === "goals" ? "sidebar-nav-item-active" : ""}`}
-              onClick={(e) => { e.preventDefault(); setActiveView("goals"); }}
+              className={`sidebar-nav-item ${activeView === "incomeProjections" ? "sidebar-nav-item-active" : ""}`}
+              onClick={(e) => { e.preventDefault(); setActiveView("incomeProjections"); }}
             >
               <span className="sidebar-nav-icon" aria-hidden>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><line x1="12" y1="3" x2="12" y2="5"/><line x1="21" y1="12" x2="19" y2="12"/><line x1="12" y1="21" x2="12" y2="19"/><line x1="3" y1="12" x2="5" y2="12"/></svg>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
               </span>
-              Metas de Ahorro
+              Proyección de Ingresos
             </a>
             <a
               href="#"
@@ -1974,7 +1936,7 @@ export function App() {
               <span className="sidebar-nav-icon" aria-hidden>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
               </span>
-              Financiamiento familia
+              Financiamiento Familia
             </a>
             <a
               href="#"
@@ -2018,9 +1980,9 @@ export function App() {
                 ? "Dashboard"
                 : activeView === "upcoming"
                 ? "Próximos salarios"
-                : activeView === "goals"
-                ? "Metas de Ahorro"
-                : "Financiamiento familia"}
+                : activeView === "incomeProjections"
+                ? "Proyección de Ingresos"
+                : "Financiamiento Familia"}
             </span>
           </nav>
           {activeView === "dashboard" && (
@@ -2047,22 +2009,16 @@ export function App() {
               </span>
             </div>
           )}
-          {activeView === "goals" && activeGoals.length > 0 && (
-            <div className="reference-bar reference-bar-compact reference-bar--goals">
+          {activeView === "incomeProjections" && (
+            <div className="reference-bar reference-bar-compact reference-bar--lavender">
               <span className="reference-left">
-                <span className="reference-main">Metas activas</span>
-                <span className="reference-amount">
-                  {activeGoals.length} meta{activeGoals.length !== 1 ? "s" : ""} en curso
-                </span>
+                <span className="reference-main">Saldo inicial</span>
+                <span className="reference-amount">{formatCurrency(projectionStartingBalance)}</span>
               </span>
               <span className="reference-right">
-                {(() => {
-                  const next = activeGoals[0];
-                  const daysLeft = getGoalDaysLeft(next);
-                  return daysLeft != null
-                    ? `Próxima meta vence en ${daysLeft} día${daysLeft !== 1 ? "s" : ""}`
-                    : "Organiza y avanza en tus objetivos";
-                })()}
+                {projectionData.length > 0
+                  ? `Saldo proyectado a ${MONTH_NAMES_ES_SHORT[projectionData[projectionData.length - 1].month - 1]} ${projectionData[projectionData.length - 1].year}: ${formatCurrency(projectionData[projectionData.length - 1].endingBalance)}`
+                  : "12 meses de proyección"}
               </span>
             </div>
           )}
@@ -2252,376 +2208,216 @@ export function App() {
           </section>
         )}
 
-        {activeView === "goals" && (
-          <section className="panel panel-goals">
-            <div className="goals-layout">
-              <div className="goals-list-card">
-                <div className="goals-list-header">
-                  <h2 className="panel-title">Tus metas activas</h2>
-                  <div className="goals-list-header-right">
-                    <p className="panel-sub-right">
-                      {activeGoals.length === 0
-                        ? "Todavía no creaste metas"
-                        : `${activeGoals.length} meta${activeGoals.length !== 1 ? "s" : ""} en curso`}
-                    </p>
-                    <button
-                      type="button"
-                      className="button goals-add-button"
-                      onClick={() => {
-                        resetGoalForm();
-                        setShowGoalModal(true);
-                      }}
-                    >
-                      + Nueva meta
-                    </button>
-                  </div>
-                </div>
-                {activeGoals.length === 0 ? (
-                  <div className="goals-empty-state">
-                    <p className="goals-empty-title">Empieza creando tu primera meta</p>
-                    <p className="goals-empty-sub">
-                      Por ejemplo: "Fondo de emergencias", "Viaje de vacaciones" o "Nuevo equipo".
-                    </p>
-                  </div>
-                ) : (
-                  <div
-                    ref={goalsSliderRef}
-                    className="goals-grid goals-slider"
-                    onMouseDown={makeHorizontalDragHandler(goalsSliderRef, goalsDragRef)}
+        {activeView === "incomeProjections" && (
+          <section className="panel panel-projection">
+            <div className="projection-header">
+              <div>
+                <h2 className="panel-title">Proyección de Ingresos</h2>
+                <p className="panel-sub-right">
+                  Planificá tus ingresos y egresos para los próximos {PROJECTION_MONTH_COUNT} meses.
+                </p>
+              </div>
+              <div className="projection-balance-form">
+                <label className="projection-balance-label" htmlFor="projection-starting-balance">
+                  Saldo inicial
+                </label>
+                <div className="projection-balance-row">
+                  <input
+                    id="projection-starting-balance"
+                    type="text"
+                    inputMode="decimal"
+                    className="input projection-balance-input"
+                    value={projectionBalanceInput}
+                    onChange={(e) => setProjectionBalanceInput(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => void handleSaveProjectionBalance()}
                   >
-                    {activeGoals.map((goal) => {
-                      const progressPct = getGoalProgressPct(goal);
-                      const remaining = getGoalRemainingAmount(goal);
-                      const daysLeft = getGoalDaysLeft(goal);
-                      const isAtRisk = goal.status === "at_risk";
-                      const isCompleted = goal.status === "completed";
-                      return (
-                        <article key={goal.id} className="goal-card">
-                          <header className="goal-card-header">
-                            <div>
-                              <h3 className="goal-card-title">{goal.name}</h3>
-                              <p className="goal-card-category">{goal.category}</p>
-                            </div>
-                            {(goal.currentAmount > 0 || isCompleted) && (
-                              <span
-                                className={`goal-status-chip goal-status-chip--${goal.status}`}
-                              >
-                                {isCompleted
-                                  ? "Completada"
-                                  : isAtRisk
-                                  ? "En riesgo"
-                                  : "En curso"}
-                              </span>
-                            )}
-                          </header>
-
-                          <div className="goal-progress">
-                            <div className="goal-progress-bar">
-                              <div
-                                className={`goal-progress-fill goal-progress-fill--${goal.status}`}
-                                style={{ width: `${progressPct}%` }}
-                              />
-                            </div>
-                            <div className="goal-progress-row">
-                              <span className="goal-progress-main">
-                                Llevas{" "}
-                                <strong>
-                                  {formatCurrency(goal.currentAmount)} /{" "}
-                                  {formatCurrency(goal.targetAmount)}
-                                </strong>
-                              </span>
-                              <span className="goal-progress-pct">
-                                {progressPct.toFixed(0)}%
-                              </span>
-                            </div>
-                            <p className="goal-progress-remaining">
-                              {remaining > 0
-                                ? `Te faltan ${formatCurrency(remaining)} para llegar.`
-                                : "¡Meta alcanzada! 🎉"}
-                            </p>
-                            {daysLeft != null && (
-                              <p className="goal-deadline">
-                                Te quedan{" "}
-                                <strong>
-                                  {daysLeft} día{daysLeft !== 1 ? "s" : ""}
-                                </strong>{" "}
-                                para tu objetivo.
-                              </p>
-                            )}
-                          </div>
-
-                          <footer className="goal-card-footer">
-                            <button
-                              type="button"
-                              className="button button-secondary goal-card-btn goal-card-btn-icon"
-                              data-tooltip="Aportar"
-                              onClick={() => {
-                                setSelectedGoalForContribution(goal);
-                                setContributionAmount("");
-                                setContributionError(null);
-                                setEditingContribution(null);
-                              }}
-                              aria-label="Aportar"
-                            >
-                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                            </button>
-                            <button
-                              type="button"
-                              className="button button-secondary goal-card-btn goal-card-btn-icon"
-                              data-tooltip="Editar"
-                              onClick={() => startEditGoal(goal)}
-                              aria-label="Editar"
-                            >
-                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-                            </button>
-                            <button
-                              type="button"
-                              className="button button-secondary goal-card-btn goal-card-btn-icon"
-                              data-tooltip="Resetear progreso"
-                              onClick={() => setConfirmResetGoal(goal)}
-                              aria-label="Resetear progreso"
-                            >
-                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
-                            </button>
-                            <button
-                              type="button"
-                              className="button goal-card-btn goal-card-btn-icon"
-                              data-tooltip="Marcar como completada"
-                              onClick={() => markGoalCompleted(goal.id)}
-                              aria-label="Marcar como completada"
-                            >
-                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                            </button>
-                          </footer>
-                        </article>
-                      );
-                    })}
-                  </div>
-                )}
+                    Guardar
+                  </button>
+                </div>
               </div>
             </div>
 
-            <section className="goals-achievements">
-              <h2 className="panel-title">Logros</h2>
-              {completedGoals.length === 0 ? (
-                <p className="goals-achievements-empty">
-                  Cuando completes una meta, aparecerá aquí para que puedas celebrar tus avances.
-                </p>
-              ) : (
-                <div
-                  ref={achievementsSliderRef}
-                  className="goals-achievements-grid goals-slider"
-                  onMouseDown={makeHorizontalDragHandler(achievementsSliderRef, achievementsDragRef)}
-                >
-                  {completedGoals.map((goal) => (
-                    <article key={goal.id} className="goal-achievement-card">
-                      <div className="goal-achievement-header">
-                        <span className="goal-achievement-icon" aria-hidden>
-                          🏆
-                        </span>
-                        <div>
-                          <h3 className="goal-achievement-title">{goal.name}</h3>
-                          <p className="goal-achievement-category">{goal.category}</p>
-                        </div>
+            <div className="projection-months">
+              {projectionData.map((monthRow, index) => {
+                const prevBalance =
+                  index === 0 ? projectionStartingBalance : projectionData[index - 1].endingBalance;
+                return (
+                  <article key={`${monthRow.year}-${monthRow.month}`} className="projection-month-card">
+                    <header className="projection-month-header">
+                      <div>
+                        <h3 className="projection-month-title">
+                          {MONTH_NAMES_ES[monthRow.month - 1]} {monthRow.year}
+                        </h3>
+                        <p className="projection-month-opening">
+                          Saldo al inicio: {formatCurrency(prevBalance)}
+                        </p>
                       </div>
-                      <p className="goal-achievement-amount">
-                        Alcanzaste {formatCurrency(goal.targetAmount)} para esta meta.
-                      </p>
-                      <p className="goal-achievement-date">
-                        Creada el {formatDisplayDate(goal.createdAt)}
-                      </p>
-                    </article>
-                  ))}
-                </div>
-              )}
-            </section>
+                      <button
+                        type="button"
+                        className="button button-secondary projection-add-line-btn"
+                        onClick={() => openProjectionLineModal(monthRow.year, monthRow.month)}
+                      >
+                        + Línea
+                      </button>
+                    </header>
+
+                    {monthRow.lines.length === 0 ? (
+                      <p className="projection-month-empty">Sin movimientos proyectados este mes.</p>
+                    ) : (
+                      <ul className="projection-lines-list">
+                        {monthRow.lines.map((line) => (
+                          <li key={line.id} className="projection-line-item">
+                            <span className="projection-line-desc">{line.description}</span>
+                            <span
+                              className={`projection-line-amount ${
+                                line.amount >= 0 ? "projection-line-amount--in" : "projection-line-amount--out"
+                              }`}
+                            >
+                              {line.amount >= 0 ? "+" : ""}
+                              {formatCurrency(line.amount)}
+                            </span>
+                            <div className="projection-line-actions">
+                              <button
+                                type="button"
+                                className="button button-secondary goal-card-btn goal-card-btn-icon"
+                                data-tooltip="Editar"
+                                onClick={() => openProjectionLineModal(monthRow.year, monthRow.month, line)}
+                                aria-label="Editar línea"
+                              >
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                              </button>
+                              <button
+                                type="button"
+                                className="button button-secondary goal-card-btn goal-card-btn-icon"
+                                data-tooltip="Eliminar"
+                                onClick={() => void handleDeleteProjectionLine(line.id)}
+                                aria-label="Eliminar línea"
+                              >
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                              </button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+
+                    <footer className="projection-month-footer">
+                      <span className="projection-month-delta">
+                        Variación del mes:{" "}
+                        <strong
+                          className={
+                            monthRow.monthDelta >= 0
+                              ? "projection-line-amount--in"
+                              : "projection-line-amount--out"
+                          }
+                        >
+                          {monthRow.monthDelta >= 0 ? "+" : ""}
+                          {formatCurrency(monthRow.monthDelta)}
+                        </strong>
+                      </span>
+                      <span className="projection-month-ending">
+                        Saldo acumulado: <strong>{formatCurrency(monthRow.endingBalance)}</strong>
+                      </span>
+                    </footer>
+                  </article>
+                );
+              })}
+            </div>
           </section>
         )}
 
         {activeView === "familyFinancing" && (
           <section className="panel panel-family">
-            <div className="goals-layout">
-              <div className="goals-list-card">
-                <div className="goals-list-header">
-                  <h2 className="panel-title">Financiamiento familia</h2>
-                  <div className="goals-list-header-right">
-                    <p className="panel-sub-right">
-                      {activeFamilyItems.length === 0
-                        ? "Todavía no cargaste items"
-                        : `${activeFamilyItems.length} item${activeFamilyItems.length !== 1 ? "s" : ""} en curso · Pendiente total ${formatCurrency(familyPendingTotal)}`}
-                    </p>
-                    <button
-                      type="button"
-                      className="button goals-add-button"
-                      onClick={() => {
-                        resetFamilyForm();
-                        setShowFamilyModal(true);
-                      }}
-                    >
-                      + Nuevo item
-                    </button>
-                  </div>
+            <div className="family-section-layout">
+              <div className="family-section-header">
+                <div>
+                  <h2 className="panel-title">Financiamiento Familia</h2>
+                  <p className="panel-sub-right">
+                    {activeFamilyItems.length === 0
+                      ? "Todavía no cargaste items"
+                      : `${activeFamilyItems.length} item${activeFamilyItems.length !== 1 ? "s" : ""} en curso · Pendiente total ${formatCurrency(familyPendingTotal)}`}
+                  </p>
                 </div>
-
-                {activeFamilyItems.length === 0 ? (
-                  <div className="goals-empty-state">
-                    <p className="goals-empty-title">Registrá una compra financiada</p>
-                    <p className="goals-empty-sub">
-                      Por ejemplo: electrodoméstico, medicamentos o compras del super que tus papás van devolviendo en cuotas.
-                    </p>
-                  </div>
-                ) : (
-                  <div
-                    ref={familySliderRef}
-                    className="goals-grid goals-slider"
-                    onMouseDown={makeHorizontalDragHandler(familySliderRef, familyDragRef)}
-                  >
-                    {activeFamilyItems.map((item) => {
-                      const installments = getFamilyItemInstallments(item.id);
-                      const paidAmount = getFamilyItemPaidAmount(item.id);
-                      const remaining = getFamilyItemRemaining(item);
-                      const progressPct = getFamilyItemProgressPct(item);
-                      const paidCount = installments.filter((row) => row.isPaid).length;
-                      const installmentsTotal = getFamilyItemInstallmentsTotal(item.id);
-                      const installmentsMismatch =
-                        Math.abs(installmentsTotal - item.totalAmount) > 0.01;
-                      return (
-                        <article key={item.id} className="goal-card family-item-card">
-                          <header className="goal-card-header">
-                            <div>
-                              <h3 className="goal-card-title">{item.name}</h3>
-                              <p className="goal-card-category family-item-date">
-                                Compra: {formatDisplayDate(item.purchaseDate)}
-                              </p>
-                              {item.notes && (
-                                <p className="family-item-notes">{item.notes}</p>
-                              )}
-                            </div>
-                            <span className="goal-status-chip goal-status-chip--in_progress">
-                              En curso
-                            </span>
-                          </header>
-
-                          <div className="goal-progress">
-                            <div className="goal-progress-bar">
-                              <div
-                                className="goal-progress-fill goal-progress-fill--in_progress"
-                                style={{ width: `${progressPct}%` }}
-                              />
-                            </div>
-                            <div className="goal-progress-row">
-                              <span className="goal-progress-main">
-                                Pagado{" "}
-                                <strong>
-                                  {formatCurrency(paidAmount)} / {formatCurrency(item.totalAmount)}
-                                </strong>
-                              </span>
-                              <span className="goal-progress-pct">
-                                {progressPct.toFixed(0)}%
-                              </span>
-                            </div>
-                            <p className="goal-progress-remaining">
-                              Restan {formatCurrency(remaining)} de {formatCurrency(item.totalAmount)}.
-                            </p>
-                            <p className="family-installments-summary">
-                              {paidCount}/{installments.length} cuota{installments.length !== 1 ? "s" : ""} pagada{paidCount !== 1 ? "s" : ""}
-                            </p>
-                            {installmentsMismatch && (
-                              <p className="family-installments-hint">
-                                Las cuotas suman {formatCurrency(installmentsTotal)} (total del item:{" "}
-                                {formatCurrency(item.totalAmount)})
-                              </p>
-                            )}
-                          </div>
-
-                          <div className="family-installments">
-                            {installments.map((installment) => (
-                              <div
-                                key={installment.id}
-                                className={`family-installment-row ${installment.isPaid ? "family-installment-row--paid" : ""}`}
-                              >
-                                <label className="family-installment-check">
-                                  <input
-                                    type="checkbox"
-                                    checked={installment.isPaid}
-                                    onChange={() => void toggleFamilyInstallmentPaid(installment)}
-                                  />
-                                  <span>
-                                    Cuota {installment.installmentNumber} · {formatDueMonth(installment.dueDate)}
-                                  </span>
-                                </label>
-                                <div className="family-installment-actions">
-                                  <span className="family-installment-amount">
-                                    {formatCurrency(installment.amount)}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="button button-secondary family-installment-edit-btn"
-                                    onClick={() => startEditFamilyInstallment(installment)}
-                                    aria-label={`Editar cuota ${installment.installmentNumber}`}
-                                  >
-                                    Editar
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-
-                          <footer className="goal-card-footer">
-                            <button
-                              type="button"
-                              className="button button-secondary goal-card-btn goal-card-btn-icon"
-                              data-tooltip="Editar"
-                              onClick={() => startEditFamilyItem(item)}
-                              aria-label="Editar"
-                            >
-                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-                            </button>
-                            <button
-                              type="button"
-                              className="button button-secondary goal-card-btn goal-card-btn-icon"
-                              data-tooltip="Eliminar"
-                              onClick={() => setConfirmDeleteFamilyItem(item)}
-                              aria-label="Eliminar"
-                            >
-                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                            </button>
-                          </footer>
-                        </article>
-                      );
-                    })}
-                  </div>
-                )}
+                <button
+                  type="button"
+                  className="button goals-add-button"
+                  onClick={() => {
+                    resetFamilyForm();
+                    setShowFamilyModal(true);
+                  }}
+                >
+                  + Nuevo item
+                </button>
               </div>
 
-              {completedFamilyItems.length > 0 && (
-                <section className="goals-achievements-section">
-                  <h2 className="panel-title goals-achievements-title">Completados</h2>
-                  <div
-                    className="goals-grid goals-slider goals-achievements-grid"
-                  >
-                    {completedFamilyItems.map((item) => (
-                      <article key={item.id} className="goal-achievement-card">
-                        <div className="goal-achievement-header">
-                          <span className="goal-achievement-icon" aria-hidden>
-                            ✓
-                          </span>
-                          <div>
-                            <h3 className="goal-achievement-title">{item.name}</h3>
-                            <p className="goal-achievement-category">
-                              {formatCurrency(item.totalAmount)} · {item.installmentCount} cuota{item.installmentCount !== 1 ? "s" : ""}
-                            </p>
+              {activeFamilyItems.length === 0 ? (
+                <div className="goals-empty-state">
+                  <p className="goals-empty-title">Registrá una compra financiada</p>
+                  <p className="goals-empty-sub">
+                    Por ejemplo: electrodoméstico, medicamentos o compras del super que tus papás van devolviendo en cuotas.
+                  </p>
+                </div>
+              ) : (
+                <ul className="tx-list-plain family-section-list">
+                  {activeFamilyItems.map((item) => {
+                    const installments = getFamilyItemInstallments(item.id);
+                    const paidCount = installments.filter((row) => row.isPaid).length;
+                    const remaining = getFamilyItemRemaining(item);
+                    const progressPct = getFamilyItemProgressPct(item);
+                    return (
+                      <li key={item.id}>
+                        <button
+                          type="button"
+                          className="family-section-row"
+                          onClick={() => setSelectedFamilyItemDetail(item)}
+                        >
+                          <div className="tx-list-body">
+                            <span className="tx-list-desc">{item.name}</span>
+                            <span className="tx-list-meta">
+                              Compra: {formatDisplayDate(item.purchaseDate)} · {paidCount}/{installments.length} cuota{installments.length !== 1 ? "s" : ""} pagada{paidCount !== 1 ? "s" : ""}
+                            </span>
                           </div>
-                        </div>
-                        <p className="goal-achievement-amount">
-                          Compra del {formatDisplayDate(item.purchaseDate)}
-                        </p>
-                        {item.notes && (
-                          <p className="family-item-notes family-item-notes--achievement">{item.notes}</p>
-                        )}
-                      </article>
+                          <div className="tx-list-right family-section-row-right">
+                            <span className="family-section-remaining">{formatCurrency(remaining)}</span>
+                            <span className="family-section-progress">{progressPct.toFixed(0)}% pagado</span>
+                          </div>
+                          <span className="family-section-row-chevron" aria-hidden>›</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+
+              {completedFamilyItems.length > 0 && (
+                <section className="family-section-completed">
+                  <h2 className="panel-title family-section-completed-title">Completados</h2>
+                  <ul className="tx-list-plain family-section-list">
+                    {completedFamilyItems.map((item) => (
+                      <li key={item.id}>
+                        <button
+                          type="button"
+                          className="family-section-row family-section-row--completed"
+                          onClick={() => setSelectedFamilyItemDetail(item)}
+                        >
+                          <div className="tx-list-body">
+                            <span className="tx-list-desc">{item.name}</span>
+                            <span className="tx-list-meta">
+                              Compra: {formatDisplayDate(item.purchaseDate)} · {formatCurrency(item.totalAmount)}
+                            </span>
+                          </div>
+                          <div className="tx-list-right family-section-row-right">
+                            <span className="family-section-status-done">Completado</span>
+                          </div>
+                          <span className="family-section-row-chevron" aria-hidden>›</span>
+                        </button>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 </section>
               )}
             </div>
@@ -2702,40 +2498,9 @@ export function App() {
         </div>
       )}
 
-      {confirmResetGoal && (
-        <div
-          className="modal-overlay"
-          onClick={() => setConfirmResetGoal(null)}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="modal-reset-goal-title"
-        >
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h2 id="modal-reset-goal-title" className="modal-title">
-              Resetear progreso
-            </h2>
-            <p className="modal-body">
-              ¿Seguro que querés resetear el progreso de esta meta a 0?
-            </p>
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="button button-secondary"
-                onClick={() => setConfirmResetGoal(null)}
-              >
-                Cancelar
-              </button>
-              <button type="button" className="button" onClick={() => void handleResetGoalProgress()}>
-                Resetear
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {confirmDeleteFamilyItem && (
         <div
-          className="modal-overlay"
+          className="modal-overlay modal-overlay--stacked"
           onClick={confirmDeleteFamilyItemCancel}
           role="dialog"
           aria-modal="true"
@@ -2762,6 +2527,178 @@ export function App() {
               </button>
               <button type="button" className="button" onClick={() => void confirmDeleteFamilyItemOk()}>
                 Eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedFamilyItemDetail && (() => {
+        const item =
+          familyItems.find((row) => row.id === selectedFamilyItemDetail.id) ?? selectedFamilyItemDetail;
+        const isReadOnly = item.status === "completed";
+        const installments = getFamilyItemInstallments(item.id);
+        const paidAmount = getFamilyItemPaidAmount(item.id);
+        const remaining = getFamilyItemRemaining(item);
+        const progressPct = getFamilyItemProgressPct(item);
+        const paidCount = installments.filter((row) => row.isPaid).length;
+        const installmentsTotal = getFamilyItemInstallmentsTotal(item.id);
+        const installmentsMismatch = Math.abs(installmentsTotal - item.totalAmount) > 0.01;
+
+        return (
+          <div
+            className="modal-overlay"
+            onClick={closeFamilyItemDetailModal}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="modal-family-detail-title"
+          >
+            <div className="modal modal-family-detail" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-family-detail-header">
+                <div>
+                  <h2 id="modal-family-detail-title" className="modal-title">
+                    {item.name}
+                  </h2>
+                  <p className="modal-family-detail-sub">
+                    Compra: {formatDisplayDate(item.purchaseDate)}
+                    {item.notes ? ` · ${item.notes}` : ""}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close-btn"
+                  onClick={closeFamilyItemDetailModal}
+                  aria-label="Cerrar"
+                >
+                  ×
+                </button>
+              </div>
+
+              <div className="goal-progress family-detail-progress">
+                <div className="goal-progress-bar">
+                  <div
+                    className={`goal-progress-fill goal-progress-fill--${isReadOnly ? "completed" : "in_progress"}`}
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </div>
+                <div className="goal-progress-row">
+                  <span className="goal-progress-main">
+                    Pagado{" "}
+                    <strong>
+                      {formatCurrency(paidAmount)} / {formatCurrency(item.totalAmount)}
+                    </strong>
+                  </span>
+                  <span className="goal-progress-pct">{progressPct.toFixed(0)}%</span>
+                </div>
+                <p className="goal-progress-remaining">
+                  {isReadOnly
+                    ? "Item completado."
+                    : `Restan ${formatCurrency(remaining)} de ${formatCurrency(item.totalAmount)}.`}
+                </p>
+                <p className="family-installments-summary">
+                  {paidCount}/{installments.length} cuota{installments.length !== 1 ? "s" : ""} pagada
+                  {paidCount !== 1 ? "s" : ""}
+                </p>
+                {installmentsMismatch && (
+                  <p className="family-installments-hint">
+                    Las cuotas suman {formatCurrency(installmentsTotal)} (total del item:{" "}
+                    {formatCurrency(item.totalAmount)})
+                  </p>
+                )}
+              </div>
+
+              <div className="family-installments family-detail-installments">
+                {installments.map((installment) => (
+                  <div
+                    key={installment.id}
+                    className={`family-installment-row ${installment.isPaid ? "family-installment-row--paid" : ""}`}
+                  >
+                    {isReadOnly ? (
+                      <span className="family-installment-check family-installment-check--readonly">
+                        <span>
+                          Cuota {installment.installmentNumber} · {formatDueMonth(installment.dueDate)}
+                        </span>
+                      </span>
+                    ) : (
+                      <label className="family-installment-check">
+                        <input
+                          type="checkbox"
+                          checked={installment.isPaid}
+                          onChange={() => handleFamilyInstallmentPaidToggle(installment)}
+                        />
+                        <span>
+                          Cuota {installment.installmentNumber} · {formatDueMonth(installment.dueDate)}
+                        </span>
+                      </label>
+                    )}
+                    <div className="family-installment-actions">
+                      <span className="family-installment-amount">
+                        {formatCurrency(installment.amount)}
+                      </span>
+                      {!isReadOnly && !installment.isPaid && (
+                        <button
+                          type="button"
+                          className="button button-secondary family-installment-edit-btn"
+                          onClick={() => startEditFamilyInstallment(installment)}
+                          aria-label={`Editar cuota ${installment.installmentNumber}`}
+                        >
+                          Editar
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {!isReadOnly && (
+                <div className="modal-actions modal-family-detail-actions">
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => {
+                      startEditFamilyItem(item);
+                      closeFamilyItemDetailModal();
+                    }}
+                  >
+                    Editar item
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => setConfirmDeleteFamilyItem(item)}
+                  >
+                    Eliminar
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
+      {confirmMarkInstallmentPaid && (
+        <div
+          className="modal-overlay modal-overlay--stacked"
+          onClick={confirmMarkInstallmentPaidCancel}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-mark-installment-paid-title"
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-mark-installment-paid-title" className="modal-title">
+              Marcar cuota como pagada
+            </h2>
+            <p className="modal-body">
+              ¿Confirmás que la cuota {confirmMarkInstallmentPaid.installmentNumber} de{" "}
+              {formatDueMonth(confirmMarkInstallmentPaid.dueDate)} por{" "}
+              <strong>{formatCurrency(confirmMarkInstallmentPaid.amount)}</strong> fue pagada?
+            </p>
+            <div className="modal-actions">
+              <button type="button" className="button button-secondary" onClick={confirmMarkInstallmentPaidCancel}>
+                Cancelar
+              </button>
+              <button type="button" className="button" onClick={() => void confirmMarkInstallmentPaidOk()}>
+                Confirmar pago
               </button>
             </div>
           </div>
@@ -2895,7 +2832,7 @@ export function App() {
 
       {editingFamilyInstallment && (
         <div
-          className="modal-overlay"
+          className="modal-overlay modal-overlay--stacked"
           onClick={closeFamilyInstallmentModal}
           role="dialog"
           aria-modal="true"
@@ -2906,7 +2843,7 @@ export function App() {
               Editar cuota {editingFamilyInstallment.installmentNumber}
             </h2>
             <p className="modal-body modal-family-installment-sub">
-              Ajustá el monto o el mes de pago si adelantaron, atrasaron o pagaron un valor distinto.
+              Ajustá el monto o el mes de pago. Las cuotas siguientes no pagadas se recalculan automáticamente según el total del item.
             </p>
             <form onSubmit={handleSubmitFamilyInstallmentEdit}>
               <div className="field">
@@ -3164,214 +3101,63 @@ export function App() {
         </div>
       )}
 
-      {showGoalModal && (
+      {projectionLineTarget && (
         <div
           className="modal-overlay"
-          onClick={() => {
-            setShowGoalModal(false);
-            resetGoalForm();
-          }}
+          onClick={closeProjectionLineModal}
           role="dialog"
           aria-modal="true"
-          aria-labelledby="modal-goal-title"
+          aria-labelledby="modal-projection-line-title"
         >
-          <div
-            className="modal modal-goal-form"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="modal-goal-header">
-              <div>
-                <h2 id="modal-goal-title" className="modal-title">
-                  {editingGoalId ? "Editar meta de ahorro" : "Nueva meta de ahorro"}
-                </h2>
-                <p className="modal-goal-subtitle">
-                  Define un objetivo, un monto a alcanzar y una fecha límite opcional.
-                </p>
-              </div>
-              <button
-                type="button"
-                className="modal-close-btn"
-                onClick={() => {
-                  setShowGoalModal(false);
-                  resetGoalForm();
-                }}
-                aria-label="Cerrar"
-              >
-                ×
-              </button>
-            </div>
-
-            <form
-              onSubmit={handleSubmitGoal}
-              className="modal-goal-form-body"
-            >
-              <div className="goals-modal-fields">
-                <div className="field">
-                  <div className="field-label-row">
-                    <label className="field-label">Nombre de la meta</label>
-                  </div>
-                  <input
-                    type="text"
-                    className="input"
-                    placeholder="Ej. Fondo de emergencias"
-                    value={goalForm.name}
-                    onChange={handleGoalFieldChange("name")}
-                  />
+          <div className="modal modal-projection-line" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-projection-line-title" className="modal-title">
+              {editingProjectionLineId ? "Editar línea" : "Nueva línea"}
+            </h2>
+            <p className="modal-body">
+              {MONTH_NAMES_ES[projectionLineTarget.month - 1]} {projectionLineTarget.year} — ingreso positivo, egreso negativo.
+            </p>
+            <form onSubmit={handleSubmitProjectionLine}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Descripción</label>
                 </div>
-                <div className="field">
-                  <div className="field-label-row">
-                    <label className="field-label">Monto objetivo</label>
-                    <span className="field-hint">Sin comas, solo números</span>
-                  </div>
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    className="input"
-                    placeholder="50000"
-                    value={goalForm.targetAmount}
-                    onChange={handleGoalFieldChange("targetAmount")}
-                  />
-                </div>
-                <div className="field">
-                  <div className="field-label-row">
-                    <label className="field-label">Fecha límite (opcional)</label>
-                  </div>
-                  <input
-                    type="date"
-                    className="input"
-                    value={goalForm.deadline}
-                    onChange={handleGoalFieldChange("deadline")}
-                  />
-                </div>
-                <div className="field">
-                  <div className="field-label-row">
-                    <label className="field-label">Categoría de ahorro</label>
-                  </div>
-                  <select
-                    className="select"
-                    value={goalForm.category}
-                    onChange={handleGoalFieldChange("category")}
-                  >
-                    <option value="">Selecciona o escribe</option>
-                    <option value="Viajes">Viajes</option>
-                    <option value="Tecnología">Tecnología</option>
-                    <option value="Salud">Salud</option>
-                    <option value="Hogar">Hogar</option>
-                    <option value="Emergencias">Emergencias</option>
-                    <option value="Otro">Otro</option>
-                  </select>
-                </div>
-              </div>
-              {goalFormError && (
-                <div className="error-text goals-error-text">{goalFormError}</div>
-              )}
-              <div className="modal-actions modal-goal-actions">
-                <button
-                  type="button"
-                  className="button button-secondary"
-                  onClick={() => {
-                    setShowGoalModal(false);
-                    resetGoalForm();
+                <input
+                  type="text"
+                  className="input"
+                  placeholder="Ej. Salario, alquiler, gastos"
+                  value={projectionLineForm.description}
+                  onChange={(e) => {
+                    setProjectionLineForm((prev) => ({ ...prev, description: e.target.value }));
+                    setProjectionLineError(null);
                   }}
-                >
+                />
+              </div>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Monto</label>
+                  <span className="field-hint">Positivo = ingreso · Negativo = egreso</span>
+                </div>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="input"
+                  placeholder="3500 o -1200"
+                  value={projectionLineForm.amount}
+                  onChange={(e) => {
+                    setProjectionLineForm((prev) => ({ ...prev, amount: e.target.value }));
+                    setProjectionLineError(null);
+                  }}
+                />
+              </div>
+              {projectionLineError && (
+                <div className="error-text goals-error-text">{projectionLineError}</div>
+              )}
+              <div className="modal-actions">
+                <button type="button" className="button button-secondary" onClick={closeProjectionLineModal}>
                   Cancelar
                 </button>
                 <button type="submit" className="button">
-                  {editingGoalId ? "Guardar cambios" : "Crear meta"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {selectedGoalForContribution && (
-        <div
-          className="modal-overlay"
-          onClick={closeContributionModal}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="modal-goal-contribution-title"
-        >
-          <div
-            className="modal modal-goal-contribution"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="modal-goal-contribution-header">
-              <div>
-                <h2
-                  id="modal-goal-contribution-title"
-                  className="modal-title"
-                >
-                  {editingContribution ? "Editar aporte" : "Aportar a la meta"}
-                </h2>
-                <p className="modal-goal-contribution-sub">
-                  {editingContribution
-                    ? "Actualiza el monto de un aporte manual ya registrado."
-                    : "Registra manualmente un aporte a esta meta de ahorro."}
-                </p>
-              </div>
-              <button
-                type="button"
-                className="modal-close-btn"
-                onClick={closeContributionModal}
-                aria-label="Cerrar"
-              >
-                ×
-              </button>
-            </div>
-
-            <form onSubmit={handleSubmitContribution}>
-              <div className="goal-contribution-summary">
-                <div className="goal-contribution-main">
-                  <span className="goal-contribution-name">
-                    {selectedGoalForContribution.name}
-                  </span>
-                  <span className="goal-contribution-category">
-                    {selectedGoalForContribution.category}
-                  </span>
-                </div>
-                <div className="goal-contribution-amounts">
-                  <span className="goal-contribution-amount">
-                    {formatCurrency(selectedGoalForContribution.currentAmount)}{" "}
-                    / {formatCurrency(selectedGoalForContribution.targetAmount)}
-                  </span>
-                </div>
-              </div>
-
-              <div className="tx-field">
-                <label className="tx-label">Monto del aporte</label>
-                <div className="tx-amount-wrap">
-                  <span className="tx-amount-prefix">$</span>
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    className={`input tx-amount-input ${
-                      contributionError ? "input-error" : ""
-                    }`}
-                    placeholder="0.00"
-                    value={contributionAmount}
-                    onChange={(e) => {
-                      setContributionAmount(e.target.value);
-                      setContributionError(null);
-                    }}
-                  />
-                </div>
-                {contributionError && (
-                  <div className="error-text">{contributionError}</div>
-                )}
-              </div>
-
-              <div className="modal-actions modal-transaction-actions">
-                <button
-                  type="button"
-                  className="button button-secondary"
-                  onClick={closeContributionModal}
-                >
-                  Cancelar
-                </button>
-                <button type="submit" className="button">
-                  {editingContribution ? "Guardar cambios" : "Guardar aporte"}
+                  {editingProjectionLineId ? "Guardar cambios" : "Agregar línea"}
                 </button>
               </div>
             </form>
@@ -4137,48 +3923,51 @@ export function App() {
             </div>
           </section>
 
-          <section className="panel panel-goals-summary">
+          <section className="panel panel-goals-summary panel-family-summary">
             <div className="goals-summary-header">
-              <h2 className="panel-title">Progreso de metas</h2>
+              <h2 className="panel-title">Financiamiento Familia</h2>
               <button
                 type="button"
                 className="button button-secondary goals-summary-link"
-                onClick={() => setActiveView("goals")}
+                onClick={() => setActiveView("familyFinancing")}
               >
-                Ver todas →
+                Ver sección →
               </button>
             </div>
-            {savingsGoals.length === 0 ? (
-              <p className="goals-summary-empty">
-                Todavía no creaste metas de ahorro. Empieza definiendo tu primer objetivo.
-              </p>
-            ) : (
-              <ul className="goals-summary-list">
-                {activeGoals.slice(0, 3).map((goal) => {
-                  const progressPct = getGoalProgressPct(goal);
-                  return (
-                    <li key={goal.id} className="goals-summary-item">
-                      <div className="goals-summary-row">
-                        <span className="goals-summary-name">{goal.name}</span>
-                        <span className="goals-summary-amount">
-                          {formatCurrency(goal.currentAmount)} / {formatCurrency(goal.targetAmount)}
+            <div className="family-dashboard-list-wrap">
+              {familyDashboardMonths.length === 1 && familyDashboardMonths[0].count === 0 ? (
+                <p className="goals-summary-empty">Sin cuotas de familia programadas.</p>
+              ) : (
+                <ul className="tx-list-plain family-dashboard-list">
+                  {familyDashboardMonths.map((row) => (
+                    <li key={`${row.year}-${row.month}`} className="tx-list-plain-item family-dashboard-row">
+                      <div className="tx-list-body">
+                        <span className="tx-list-desc">
+                          {MONTH_NAMES_ES[row.month - 1]} {row.year}
                         </span>
-                      </div>
-                      <div className="goals-summary-bar">
-                        <div
-                          className="goals-summary-bar-fill"
-                          style={{ width: `${progressPct}%` }}
-                        >
-                          <span className="goals-summary-bar-label">
-                            {progressPct.toFixed(0)}%
+                        {row.count > 0 && (
+                          <span className="tx-list-meta">
+                            {row.count} cuota{row.count !== 1 ? "s" : ""}
                           </span>
-                        </div>
+                        )}
+                      </div>
+                      <div className="tx-list-right family-dashboard-right">
+                        {row.count === 0 ? (
+                          <span className="tx-list-meta">Sin cuotas</span>
+                        ) : (
+                          <>
+                            <span className="family-dashboard-amount">{formatCurrency(row.total)}</span>
+                            <span className={`family-dashboard-status family-dashboard-status--${row.status}`}>
+                              {getFamilyMonthStatusLabel(row)}
+                            </span>
+                          </>
+                        )}
                       </div>
                     </li>
-                  );
-                })}
-              </ul>
-            )}
+                  ))}
+                </ul>
+              )}
+            </div>
           </section>
         </div>
         </>
@@ -4247,7 +4036,7 @@ export function App() {
                   }
                   const ymd = c.ymd!;
                   const act = calendarActivitiesByDate[ymd];
-                  const hasActivity = act && (act.transactions.length > 0 || act.salaries.length > 0 || act.goals.length > 0);
+                  const hasActivity = act && (act.transactions.length > 0 || act.salaries.length > 0);
                   const isToday = ymd === todayYmd;
                   const isHovered = ymd === calendarHoveredDate;
                   const dayActivities = calendarActivitiesByDate[ymd];
@@ -4270,7 +4059,7 @@ export function App() {
                               return date.toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" });
                             })()}
                           </div>
-                          {dayActivities && (dayActivities.transactions.length > 0 || dayActivities.salaries.length > 0 || dayActivities.goals.length > 0) ? (
+                          {dayActivities && (dayActivities.transactions.length > 0 || dayActivities.salaries.length > 0) ? (
                             <ul className="calendar-day-tooltip-list">
                               {dayActivities.transactions.map((e) => (
                                 <li key={`tx-${e.id}`} className="calendar-day-tooltip-item">
@@ -4286,12 +4075,6 @@ export function App() {
                                   <span className="calendar-day-tooltip-icon">$</span>
                                   <span>Cobro salario {MONTH_NAMES_ES[s.month - 1]} {s.year}</span>
                                   <span className="calendar-day-tooltip-amount-in">{formatCurrency(s.amount)}</span>
-                                </li>
-                              ))}
-                              {dayActivities.goals.map((g, idx) => (
-                                <li key={`goal-${g.deadline}-${idx}`} className="calendar-day-tooltip-item">
-                                  <span className="calendar-day-tooltip-icon">◎</span>
-                                  <span>Fecha límite: {g.name}</span>
                                 </li>
                               ))}
                             </ul>
