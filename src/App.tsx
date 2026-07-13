@@ -66,7 +66,117 @@ function daysUntil(d: Date): number {
   return Math.max(0, Math.ceil((target.getTime() - today.getTime()) / 86400000));
 }
 
-type ViewId = "dashboard" | "upcoming" | "familyFinancing" | "incomeProjections";
+type ViewId = "dashboard" | "upcoming" | "familyFinancing" | "incomeProjections" | "wishList";
+
+type WishListStatus = "pending" | "purchased";
+type WishListPriority = "low" | "medium" | "high";
+
+interface WishListItem {
+  id: string;
+  name: string;
+  estimatedPrice: number | null;
+  notes: string | null;
+  priority: WishListPriority;
+  status: WishListStatus;
+  createdAt: string;
+  purchasedAt: string | null;
+}
+
+const WISH_PRIORITY_WEIGHT: Record<WishListPriority, number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+};
+
+const WISH_PRIORITY_LABELS: Record<WishListPriority, string> = {
+  low: "Baja",
+  medium: "Media",
+  high: "Alta",
+};
+
+function mapRowToWishListItem(row: {
+  id: string;
+  name: string;
+  estimated_price: number | null;
+  notes: string | null;
+  priority: string;
+  status: string;
+  created_at: string;
+  purchased_at: string | null;
+}): WishListItem {
+  return {
+    id: String(row.id),
+    name: row.name,
+    estimatedPrice: row.estimated_price != null ? Number(row.estimated_price) : null,
+    notes: row.notes,
+    priority: row.priority as WishListPriority,
+    status: row.status as WishListStatus,
+    createdAt: row.created_at,
+    purchasedAt: row.purchased_at,
+  };
+}
+
+function formatWishListPurchasedDate(iso: string | null): string {
+  if (!iso) return "";
+  return formatDisplayDate(iso.split("T")[0]);
+}
+
+function WishListPendingRow({
+  item,
+  onMarkPurchased,
+  onEdit,
+  onDelete,
+}: {
+  item: WishListItem;
+  onMarkPurchased: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="wish-list-row wish-list-row--pending">
+      <div className="wish-list-row-body">
+        <span className="tx-list-desc">{item.name}</span>
+        <span className="tx-list-meta wish-list-row-meta">
+          <span className={`wish-list-priority-chip wish-list-priority-chip--${item.priority}`}>
+            {WISH_PRIORITY_LABELS[item.priority]}
+          </span>
+          {item.notes && <span className="wish-list-notes-preview">{item.notes}</span>}
+        </span>
+      </div>
+      {item.estimatedPrice != null && (
+        <span className="wish-list-price wish-list-price--primary">{formatCurrency(item.estimatedPrice)}</span>
+      )}
+      <button
+        type="button"
+        className="wish-list-purchased-link"
+        onClick={onMarkPurchased}
+        aria-label={`Marcar ${item.name} como comprado`}
+      >
+        Comprado
+      </button>
+      <div className="wish-list-row-actions">
+        <button
+          type="button"
+          className="wish-list-action-btn"
+          data-tooltip="Editar"
+          onClick={onEdit}
+          aria-label="Editar deseo"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+        </button>
+        <button
+          type="button"
+          className="wish-list-action-btn wish-list-action-btn--danger"
+          data-tooltip="Eliminar"
+          onClick={onDelete}
+          aria-label="Eliminar deseo"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </div>
+    </div>
+  );
+}
 
 type ProjectionLineType = "income" | "expense";
 
@@ -468,6 +578,21 @@ export function App() {
   const [addProjectionMonthInput, setAddProjectionMonthInput] = useState("");
   const [addProjectionMonthError, setAddProjectionMonthError] = useState<string | null>(null);
   const [confirmDeleteProjectionMonth, setConfirmDeleteProjectionMonth] = useState<IncomeProjectionMonth | null>(null);
+  const [showProjectionBalanceModal, setShowProjectionBalanceModal] = useState(false);
+  const [projectionBalanceError, setProjectionBalanceError] = useState<string | null>(null);
+  const [wishListItems, setWishListItems] = useState<WishListItem[]>([]);
+  const [showWishListModal, setShowWishListModal] = useState(false);
+  const [editingWishListItemId, setEditingWishListItemId] = useState<string | null>(null);
+  const [wishListForm, setWishListForm] = useState({
+    name: "",
+    estimatedPrice: "",
+    notes: "",
+    priority: "medium" as WishListPriority,
+  });
+  const [wishListFormError, setWishListFormError] = useState<string | null>(null);
+  const [confirmDeleteWishListItem, setConfirmDeleteWishListItem] = useState<WishListItem | null>(null);
+  const [confirmMarkWishListPurchased, setConfirmMarkWishListPurchased] = useState<WishListItem | null>(null);
+  const [wishListPurchaseDateInput, setWishListPurchaseDateInput] = useState(todayIso());
   const [familyForm, setFamilyForm] = useState({
     name: "",
     totalAmount: "",
@@ -510,6 +635,7 @@ export function App() {
           { data: projectionSettings },
           { data: projectionMonthsRows },
           { data: projectionLinesRows },
+          { data: wishListRows },
         ] = await Promise.all([
           supabase
             .from("movements")
@@ -534,6 +660,10 @@ export function App() {
           supabase.from("income_projection_settings").select("starting_balance").eq("id", 1).maybeSingle(),
           supabase.from("income_projection_months").select("id, year, month").order("year", { ascending: true }).order("month", { ascending: true }),
           supabase.from("income_projection_lines").select("id, month_id, description, amount, sort_order").order("sort_order", { ascending: true }),
+          supabase
+            .from("wish_list_items")
+            .select("id, name, estimated_price, notes, priority, status, created_at, purchased_at")
+            .order("created_at", { ascending: false }),
         ]);
 
         if (movements) {
@@ -638,6 +768,21 @@ export function App() {
                 purchaseDateByItemId.get(String(row.item_id)),
               ),
             ),
+          );
+        }
+
+        if (wishListRows && Array.isArray(wishListRows)) {
+          setWishListItems(
+            wishListRows.map((row: {
+              id: string;
+              name: string;
+              estimated_price: number | null;
+              notes: string | null;
+              priority: string;
+              status: string;
+              created_at: string;
+              purchased_at: string | null;
+            }) => mapRowToWishListItem(row)),
           );
         }
       } catch {
@@ -1138,15 +1283,34 @@ export function App() {
     return newMonth.id;
   };
 
-  const handleSaveProjectionBalance = async () => {
+  const openProjectionBalanceModal = () => {
+    setProjectionBalanceInput(String(projectionStartingBalance));
+    setProjectionBalanceError(null);
+    setShowProjectionBalanceModal(true);
+  };
+
+  const closeProjectionBalanceModal = () => {
+    setShowProjectionBalanceModal(false);
+    setProjectionBalanceError(null);
+  };
+
+  const handleSaveProjectionBalance = async (event?: React.FormEvent) => {
+    event?.preventDefault();
     const raw = projectionBalanceInput.replace(/\s/g, "").replace(",", ".");
     const parsed = Number(raw);
-    if (Number.isNaN(parsed)) return;
+    if (!raw || Number.isNaN(parsed)) {
+      setProjectionBalanceError("Ingresa un monto válido.");
+      return;
+    }
     const { error } = await supabase
       .from("income_projection_settings")
       .upsert({ id: 1, starting_balance: parsed }, { onConflict: "id" });
-    if (error) return;
+    if (error) {
+      setProjectionBalanceError("No se pudo guardar el saldo inicial.");
+      return;
+    }
     setProjectionStartingBalance(parsed);
+    closeProjectionBalanceModal();
   };
 
   const openProjectionLineModal = (year: number, month: number, line?: IncomeProjectionLine) => {
@@ -1229,6 +1393,183 @@ export function App() {
 
   const confirmDeleteProjectionMonthCancel = () => {
     setConfirmDeleteProjectionMonth(null);
+  };
+
+  const resetWishListForm = () => {
+    setWishListForm({ name: "", estimatedPrice: "", notes: "", priority: "medium" });
+    setWishListFormError(null);
+  };
+
+  const openWishListModal = (item?: WishListItem) => {
+    if (item) {
+      setEditingWishListItemId(item.id);
+      setWishListForm({
+        name: item.name,
+        estimatedPrice: item.estimatedPrice != null ? String(item.estimatedPrice) : "",
+        notes: item.notes ?? "",
+        priority: item.priority,
+      });
+    } else {
+      setEditingWishListItemId(null);
+      resetWishListForm();
+    }
+    setShowWishListModal(true);
+  };
+
+  const closeWishListModal = () => {
+    setShowWishListModal(false);
+    setEditingWishListItemId(null);
+    resetWishListForm();
+  };
+
+  const handleSubmitWishListItem = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const name = wishListForm.name.trim();
+    const notes = wishListForm.notes.trim();
+    const priceRaw = wishListForm.estimatedPrice.replace(/\s/g, "").replace(",", ".");
+    let estimatedPrice: number | null = null;
+    if (priceRaw) {
+      const parsed = Number(priceRaw);
+      if (Number.isNaN(parsed) || parsed <= 0) {
+        setWishListFormError("Ingresa un precio estimado mayor a 0 o déjalo vacío.");
+        return;
+      }
+      estimatedPrice = parsed;
+    }
+    if (!name) {
+      setWishListFormError("Ingresa un nombre.");
+      return;
+    }
+    if (editingWishListItemId) {
+      const { data, error } = await supabase
+        .from("wish_list_items")
+        .update({
+          name,
+          estimated_price: estimatedPrice,
+          notes: notes || null,
+          priority: wishListForm.priority,
+        })
+        .eq("id", editingWishListItemId)
+        .select("id, name, estimated_price, notes, priority, status, created_at, purchased_at")
+        .single();
+      if (error) {
+        setWishListFormError(error.message || "No se pudo actualizar el deseo.");
+        return;
+      }
+      const updated = mapRowToWishListItem(data as {
+        id: string;
+        name: string;
+        estimated_price: number | null;
+        notes: string | null;
+        priority: string;
+        status: string;
+        created_at: string;
+        purchased_at: string | null;
+      });
+      setWishListItems((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+    } else {
+      const { data, error } = await supabase
+        .from("wish_list_items")
+        .insert({
+          name,
+          estimated_price: estimatedPrice,
+          notes: notes || null,
+          priority: wishListForm.priority,
+          status: "pending",
+        })
+        .select("id, name, estimated_price, notes, priority, status, created_at, purchased_at")
+        .single();
+      if (error) {
+        setWishListFormError(error.message || "No se pudo crear el deseo.");
+        return;
+      }
+      const created = mapRowToWishListItem(data as {
+        id: string;
+        name: string;
+        estimated_price: number | null;
+        notes: string | null;
+        priority: string;
+        status: string;
+        created_at: string;
+        purchased_at: string | null;
+      });
+      setWishListItems((prev) => [created, ...prev]);
+    }
+    closeWishListModal();
+  };
+
+  const openMarkWishListPurchasedModal = (item: WishListItem) => {
+    setConfirmMarkWishListPurchased(item);
+    setWishListPurchaseDateInput(todayIso());
+  };
+
+  const confirmMarkWishListPurchasedCancel = () => {
+    setConfirmMarkWishListPurchased(null);
+  };
+
+  const confirmMarkWishListPurchasedOk = async () => {
+    if (!confirmMarkWishListPurchased) return;
+    if (!wishListPurchaseDateInput) return;
+    const purchasedAt = `${wishListPurchaseDateInput}T12:00:00.000Z`;
+    const { data, error } = await supabase
+      .from("wish_list_items")
+      .update({ status: "purchased", purchased_at: purchasedAt })
+      .eq("id", confirmMarkWishListPurchased.id)
+      .select("id, name, estimated_price, notes, priority, status, created_at, purchased_at")
+      .single();
+    if (error) {
+      confirmMarkWishListPurchasedCancel();
+      return;
+    }
+    const updated = mapRowToWishListItem(data as {
+      id: string;
+      name: string;
+      estimated_price: number | null;
+      notes: string | null;
+      priority: string;
+      status: string;
+      created_at: string;
+      purchased_at: string | null;
+    });
+    setWishListItems((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+    confirmMarkWishListPurchasedCancel();
+  };
+
+  const unmarkWishListItemPurchased = async (id: string) => {
+    const { data, error } = await supabase
+      .from("wish_list_items")
+      .update({ status: "pending", purchased_at: null })
+      .eq("id", id)
+      .select("id, name, estimated_price, notes, priority, status, created_at, purchased_at")
+      .single();
+    if (error) return;
+    const updated = mapRowToWishListItem(data as {
+      id: string;
+      name: string;
+      estimated_price: number | null;
+      notes: string | null;
+      priority: string;
+      status: string;
+      created_at: string;
+      purchased_at: string | null;
+    });
+    setWishListItems((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+  };
+
+  const confirmDeleteWishListItemOk = async () => {
+    if (!confirmDeleteWishListItem) return;
+    const id = confirmDeleteWishListItem.id;
+    const { error } = await supabase.from("wish_list_items").delete().eq("id", id);
+    if (error) {
+      setConfirmDeleteWishListItem(null);
+      return;
+    }
+    setWishListItems((prev) => prev.filter((item) => item.id !== id));
+    setConfirmDeleteWishListItem(null);
+  };
+
+  const confirmDeleteWishListItemCancel = () => {
+    setConfirmDeleteWishListItem(null);
   };
 
   const handleSubmitProjectionLine = async (event: React.FormEvent) => {
@@ -1903,6 +2244,36 @@ export function App() {
     });
   }, [projectionStartingBalance, projectionMonths, projectionLines]);
 
+  const pendingWishListItems = useMemo(
+    () =>
+      wishListItems
+        .filter((item) => item.status === "pending")
+        .sort((a, b) => {
+          const priorityDiff = WISH_PRIORITY_WEIGHT[a.priority] - WISH_PRIORITY_WEIGHT[b.priority];
+          if (priorityDiff !== 0) return priorityDiff;
+          return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        }),
+    [wishListItems],
+  );
+
+  const purchasedWishListItems = useMemo(
+    () =>
+      wishListItems
+        .filter((item) => item.status === "purchased")
+        .sort((a, b) => {
+          const aTime = a.purchasedAt ? new Date(a.purchasedAt).getTime() : 0;
+          const bTime = b.purchasedAt ? new Date(b.purchasedAt).getTime() : 0;
+          return bTime - aTime;
+        }),
+    [wishListItems],
+  );
+
+  const pendingWishListTotal = useMemo(
+    () =>
+      pendingWishListItems.reduce((sum, item) => sum + (item.estimatedPrice ?? 0), 0),
+    [pendingWishListItems],
+  );
+
   useEffect(() => {
     if (
       !confirmDelete &&
@@ -1919,7 +2290,11 @@ export function App() {
       !confirmMarkInstallmentPaid &&
       !selectedProjectionMonthDetail &&
       !showAddProjectionMonthModal &&
-      !confirmDeleteProjectionMonth
+      !confirmDeleteProjectionMonth &&
+      !showProjectionBalanceModal &&
+      !showWishListModal &&
+      !confirmDeleteWishListItem &&
+      !confirmMarkWishListPurchased
     )
       return;
     const onKey = (e: KeyboardEvent) => {
@@ -1941,6 +2316,10 @@ export function App() {
         closeProjectionMonthDetailModal();
         closeAddProjectionMonthModal();
         confirmDeleteProjectionMonthCancel();
+        closeProjectionBalanceModal();
+        closeWishListModal();
+        confirmDeleteWishListItemCancel();
+        confirmMarkWishListPurchasedCancel();
         if (expandedChartModal) setExpandedChartModal(null);
         if (showCalendarModal) setShowCalendarModal(false);
       }
@@ -1963,6 +2342,10 @@ export function App() {
     selectedProjectionMonthDetail,
     showAddProjectionMonthModal,
     confirmDeleteProjectionMonth,
+    showProjectionBalanceModal,
+    showWishListModal,
+    confirmDeleteWishListItem,
+    confirmMarkWishListPurchased,
     expandedChartModal,
     showCalendarModal,
   ]);
@@ -2051,6 +2434,19 @@ export function App() {
               Calendario
             </a>
           </div>
+          <div className="sidebar-nav-group">
+            <div className="sidebar-nav-label">LISTAS</div>
+            <a
+              href="#"
+              className={`sidebar-nav-item ${activeView === "wishList" ? "sidebar-nav-item-active" : ""}`}
+              onClick={(e) => { e.preventDefault(); setActiveView("wishList"); }}
+            >
+              <span className="sidebar-nav-icon" aria-hidden>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+              </span>
+              Lista de Deseos
+            </a>
+          </div>
         </nav>
         <div className="sidebar-date-wrap">
           <span className="sidebar-date" aria-live="polite">
@@ -2077,6 +2473,8 @@ export function App() {
                 ? "Próximos salarios"
                 : activeView === "incomeProjections"
                 ? "Proyección de Ingresos"
+                : activeView === "wishList"
+                ? "Lista de Deseos"
                 : "Financiamiento Familia"}
             </span>
           </nav>
@@ -2107,12 +2505,16 @@ export function App() {
           {activeView === "incomeProjections" && (
             <div className="reference-bar reference-bar-compact reference-bar--lavender">
               <span className="reference-left">
-                <span className="reference-main">Saldo inicial</span>
-                <span className="reference-amount">{formatCurrency(projectionStartingBalance)}</span>
+                <span className="reference-main">Proyección</span>
+                <span className="reference-amount">
+                  {projectionData.length > 0
+                    ? `${projectionData.length} mes${projectionData.length !== 1 ? "es" : ""}`
+                    : "Sin meses"}
+                </span>
               </span>
               <span className="reference-right">
                 {projectionData.length > 0
-                  ? `Último mes: ${formatCurrency(projectionData[projectionData.length - 1].endingBalance)}`
+                  ? `Saldo final: ${formatCurrency(projectionData[projectionData.length - 1].endingBalance)}`
                   : "Agregá meses a tu proyección"}
               </span>
             </div>
@@ -2146,6 +2548,19 @@ export function App() {
                   : currentMonthFamilySummary.status === "pending"
                   ? "Pendiente"
                   : `Parcial · ${currentMonthFamilySummary.paidCount}/${currentMonthFamilySummary.count} pagadas`}
+              </span>
+            </div>
+          )}
+          {activeView === "wishList" && (
+            <div className="reference-bar reference-bar-compact reference-bar--lavender">
+              <span className="reference-left">
+                <span className="reference-main">Deseos pendientes</span>
+                <span className="reference-amount">{pendingWishListItems.length}</span>
+              </span>
+              <span className="reference-right">
+                {pendingWishListTotal > 0
+                  ? `Total estimado ${formatCurrency(pendingWishListTotal)}`
+                  : "Sin precios estimados"}
               </span>
             </div>
           )}
@@ -2310,6 +2725,13 @@ export function App() {
                 <div>
                   <h2 className="panel-title">Proyección de Ingresos</h2>
                   <p className="panel-sub-right">Planificá ingresos y gastos mes a mes.</p>
+                  <button
+                    type="button"
+                    className="projection-balance-link"
+                    onClick={openProjectionBalanceModal}
+                  >
+                    Saldo inicial: {formatCurrency(projectionStartingBalance)}
+                  </button>
                 </div>
                 <div className="projection-section-header-actions">
                   <button type="button" className="button goals-add-button" onClick={openAddProjectionMonthModal}>
@@ -2318,28 +2740,14 @@ export function App() {
                 </div>
               </div>
 
-              <div className="projection-balance-card">
-                <label className="projection-balance-label" htmlFor="projection-starting-balance">
-                  Saldo inicial
-                </label>
-                <div className="projection-balance-row">
-                  <input
-                    id="projection-starting-balance"
-                    type="text"
-                    inputMode="decimal"
-                    className="input projection-balance-input"
-                    value={projectionBalanceInput}
-                    onChange={(e) => setProjectionBalanceInput(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() => void handleSaveProjectionBalance()}
-                  >
-                    Guardar
+              {projectionStartingBalance === 0 && projectionData.length === 0 && (
+                <div className="projection-setup-banner">
+                  <p>Configurá tu saldo inicial para empezar a proyectar desde un punto de partida real.</p>
+                  <button type="button" className="button button-secondary" onClick={openProjectionBalanceModal}>
+                    Configurar saldo inicial
                   </button>
                 </div>
-              </div>
+              )}
 
               {projectionData.length === 0 ? (
                 <div className="goals-empty-state">
@@ -2354,7 +2762,13 @@ export function App() {
                     <li key={monthRow.id}>
                       <button
                         type="button"
-                        className="projection-section-row"
+                        className={`projection-section-row ${
+                          monthRow.monthDelta > 0
+                            ? "projection-section-row--up"
+                            : monthRow.monthDelta < 0
+                            ? "projection-section-row--down"
+                            : ""
+                        }`}
                         onClick={() =>
                           setSelectedProjectionMonthDetail({
                             id: monthRow.id,
@@ -2368,13 +2782,16 @@ export function App() {
                             {MONTH_NAMES_ES[monthRow.month - 1]} {monthRow.year}
                           </span>
                           <span className="tx-list-meta">
-                            Saldo inicio {formatCurrency(monthRow.openingBalance)} · {monthRow.lines.length} línea
+                            {monthRow.lines.length} línea
                             {monthRow.lines.length !== 1 ? "s" : ""}
                           </span>
                         </div>
                         <div className="tx-list-right projection-section-row-right">
+                          <span className="projection-section-ending projection-section-ending--primary">
+                            {formatCurrency(monthRow.endingBalance)}
+                          </span>
                           <span
-                            className={`projection-section-delta ${
+                            className={`projection-section-delta projection-section-delta--secondary ${
                               monthRow.monthDelta >= 0
                                 ? "projection-line-amount--in"
                                 : "projection-line-amount--out"
@@ -2382,9 +2799,6 @@ export function App() {
                           >
                             {monthRow.monthDelta >= 0 ? "+" : ""}
                             {formatCurrency(monthRow.monthDelta)}
-                          </span>
-                          <span className="projection-section-ending">
-                            Acum. {formatCurrency(monthRow.endingBalance)}
                           </span>
                         </div>
                         <span className="projection-section-row-chevron" aria-hidden>
@@ -2489,6 +2903,97 @@ export function App() {
                   </ul>
                 </section>
               )}
+            </div>
+          </section>
+        )}
+
+        {activeView === "wishList" && (
+          <section className="panel panel-wish-list">
+            <div className="wish-list-section-layout">
+              <div className="wish-list-section-header">
+                <div>
+                  <h2 className="panel-title">Lista de Deseos</h2>
+                  <p className="panel-sub-right">
+                    {pendingWishListItems.length === 0
+                      ? "Todavía no agregaste deseos"
+                      : `${pendingWishListItems.length} deseo${pendingWishListItems.length !== 1 ? "s" : ""} pendiente${pendingWishListItems.length !== 1 ? "s" : ""}${
+                          pendingWishListTotal > 0 ? ` · Total estimado ${formatCurrency(pendingWishListTotal)}` : ""
+                        }`}
+                  </p>
+                </div>
+                <button type="button" className="button goals-add-button" onClick={() => openWishListModal()}>
+                  + Nuevo deseo
+                </button>
+              </div>
+
+              {pendingWishListItems.length === 0 ? (
+                <div className="goals-empty-state">
+                  <p className="goals-empty-title">Tu lista está vacía</p>
+                  <p className="goals-empty-sub">
+                    Agregá cosas que quieras comprar y marcálas cuando las consigas.
+                  </p>
+                </div>
+              ) : (
+                <ul className="tx-list-plain wish-list-section-list">
+                  {pendingWishListItems.map((item) => (
+                      <li key={item.id}>
+                        <WishListPendingRow
+                          item={item}
+                          onMarkPurchased={() => openMarkWishListPurchasedModal(item)}
+                          onEdit={() => openWishListModal(item)}
+                          onDelete={() => setConfirmDeleteWishListItem(item)}
+                        />
+                      </li>
+                    ))}
+                </ul>
+              )}
+
+              <section className="wish-list-completed">
+                <h2 className="panel-title wish-list-completed-title">Comprados</h2>
+                {purchasedWishListItems.length === 0 ? (
+                  <p className="wish-list-completed-empty">
+                    Cuando compres algo de tu lista, aparecerá aquí.
+                  </p>
+                ) : (
+                  <ul className="tx-list-plain wish-list-section-list">
+                    {purchasedWishListItems.map((item) => (
+                      <li key={item.id}>
+                        <div className="wish-list-row wish-list-row--purchased">
+                          <span className="wish-list-purchased-check" aria-hidden>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                          </span>
+                          <div className="wish-list-row-body">
+                            <span className="tx-list-desc wish-list-desc--purchased">{item.name}</span>
+                            <span className="tx-list-meta">
+                              Comprado: {formatWishListPurchasedDate(item.purchasedAt)}
+                              {item.estimatedPrice != null ? ` · ${formatCurrency(item.estimatedPrice)}` : ""}
+                              {item.notes ? ` · ${item.notes}` : ""}
+                            </span>
+                          </div>
+                          <div className="wish-list-row-actions wish-list-row-actions--purchased">
+                            <button
+                              type="button"
+                              className="wish-list-restore-link"
+                              onClick={() => void unmarkWishListItemPurchased(item.id)}
+                            >
+                              Volver a deseos
+                            </button>
+                            <button
+                              type="button"
+                              className="wish-list-action-btn wish-list-action-btn--danger"
+                              data-tooltip="Eliminar"
+                              onClick={() => setConfirmDeleteWishListItem(item)}
+                              aria-label="Eliminar comprado"
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                            </button>
+                          </div>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
             </div>
           </section>
         )}
@@ -3163,6 +3668,220 @@ export function App() {
                 </button>
                 <button type="submit" className="button button-tx-submit">
                   Agregar transacción
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showWishListModal && (
+        <div
+          className="modal-overlay"
+          onClick={closeWishListModal}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-wish-list-title"
+        >
+          <div className="modal modal-wish-list" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-wish-list-title" className="modal-title">
+              {editingWishListItemId ? "Editar deseo" : "Nuevo deseo"}
+            </h2>
+            <form onSubmit={(e) => void handleSubmitWishListItem(e)}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Nombre</label>
+                </div>
+                <input
+                  type="text"
+                  className="input"
+                  placeholder="Ej. Auriculares, silla ergonómica"
+                  value={wishListForm.name}
+                  onChange={(e) => {
+                    setWishListForm((prev) => ({ ...prev, name: e.target.value }));
+                    setWishListFormError(null);
+                  }}
+                />
+              </div>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Precio estimado</label>
+                  <span className="field-hint">Opcional</span>
+                </div>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  className="input"
+                  placeholder="2500"
+                  value={wishListForm.estimatedPrice}
+                  onChange={(e) => {
+                    setWishListForm((prev) => ({ ...prev, estimatedPrice: e.target.value }));
+                    setWishListFormError(null);
+                  }}
+                />
+              </div>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Prioridad</label>
+                </div>
+                <select
+                  className="input"
+                  value={wishListForm.priority}
+                  onChange={(e) => {
+                    setWishListForm((prev) => ({
+                      ...prev,
+                      priority: e.target.value as WishListPriority,
+                    }));
+                    setWishListFormError(null);
+                  }}
+                >
+                  <option value="high">Alta</option>
+                  <option value="medium">Media</option>
+                  <option value="low">Baja</option>
+                </select>
+              </div>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Notas</label>
+                  <span className="field-hint">Opcional</span>
+                </div>
+                <input
+                  type="text"
+                  className="input"
+                  placeholder="Color, tienda, modelo..."
+                  value={wishListForm.notes}
+                  onChange={(e) => {
+                    setWishListForm((prev) => ({ ...prev, notes: e.target.value }));
+                    setWishListFormError(null);
+                  }}
+                />
+              </div>
+              {wishListFormError && (
+                <div className="error-text goals-error-text">{wishListFormError}</div>
+              )}
+              <div className="modal-actions">
+                <button type="button" className="button button-secondary" onClick={closeWishListModal}>
+                  Cancelar
+                </button>
+                <button type="submit" className="button">
+                  {editingWishListItemId ? "Guardar cambios" : "Agregar deseo"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {confirmDeleteWishListItem && (
+        <div
+          className="modal-overlay modal-overlay--stacked"
+          onClick={confirmDeleteWishListItemCancel}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-delete-wish-list-title"
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-delete-wish-list-title" className="modal-title">
+              Eliminar deseo
+            </h2>
+            <p className="modal-body">
+              ¿Eliminar <strong>{confirmDeleteWishListItem.name}</strong>?
+            </p>
+            <div className="modal-actions">
+              <button type="button" className="button button-secondary" onClick={confirmDeleteWishListItemCancel}>
+                Cancelar
+              </button>
+              <button type="button" className="button" onClick={() => void confirmDeleteWishListItemOk()}>
+                Eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmMarkWishListPurchased && (
+        <div
+          className="modal-overlay"
+          onClick={confirmMarkWishListPurchasedCancel}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-mark-wish-list-title"
+        >
+          <div className="modal modal-wish-list-purchased" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-mark-wish-list-title" className="modal-title">
+              Marcar como comprado
+            </h2>
+            <p className="modal-body modal-wish-list-purchased-sub">
+              <strong>{confirmMarkWishListPurchased.name}</strong>
+            </p>
+            <form onSubmit={(e) => { e.preventDefault(); void confirmMarkWishListPurchasedOk(); }}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label">Fecha de compra</label>
+                </div>
+                <input
+                  type="date"
+                  className="input"
+                  value={wishListPurchaseDateInput}
+                  onChange={(e) => setWishListPurchaseDateInput(e.target.value)}
+                />
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="button button-secondary" onClick={confirmMarkWishListPurchasedCancel}>
+                  Cancelar
+                </button>
+                <button type="submit" className="button">
+                  Confirmar
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showProjectionBalanceModal && (
+        <div
+          className="modal-overlay"
+          onClick={closeProjectionBalanceModal}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-projection-balance-title"
+        >
+          <div className="modal modal-projection-balance" onClick={(e) => e.stopPropagation()}>
+            <h2 id="modal-projection-balance-title" className="modal-title">
+              Saldo inicial
+            </h2>
+            <p className="modal-body modal-projection-balance-sub">
+              Punto de partida para calcular el saldo acumulado mes a mes.
+            </p>
+            <form onSubmit={(e) => void handleSaveProjectionBalance(e)}>
+              <div className="field">
+                <div className="field-label-row">
+                  <label className="field-label" htmlFor="projection-starting-balance">
+                    Monto
+                  </label>
+                </div>
+                <input
+                  id="projection-starting-balance"
+                  type="text"
+                  inputMode="decimal"
+                  className="input"
+                  value={projectionBalanceInput}
+                  onChange={(e) => {
+                    setProjectionBalanceInput(e.target.value);
+                    setProjectionBalanceError(null);
+                  }}
+                />
+              </div>
+              {projectionBalanceError && (
+                <div className="error-text goals-error-text">{projectionBalanceError}</div>
+              )}
+              <div className="modal-actions">
+                <button type="button" className="button button-secondary" onClick={closeProjectionBalanceModal}>
+                  Cancelar
+                </button>
+                <button type="submit" className="button">
+                  Guardar
                 </button>
               </div>
             </form>
