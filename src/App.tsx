@@ -966,26 +966,6 @@ export function App() {
     [entries],
   );
 
-  /** Variación del total vs mes anterior (para Mis cuentas) */
-  const totalVsLastMonth = useMemo(() => {
-    const now = new Date();
-    const currentYear = now.getFullYear();
-    const currentMonth = now.getMonth() + 1;
-    const prevYear = currentMonth === 1 ? currentYear - 1 : currentYear;
-    const prevMonth = currentMonth === 1 ? 12 : currentMonth - 1;
-    const currPrefix = `${currentYear}-${String(currentMonth).padStart(2, "0")}`;
-    const prevPrefix = `${prevYear}-${String(prevMonth).padStart(2, "0")}`;
-    let currSum = 0;
-    let prevSum = 0;
-    for (const e of entries) {
-      if (e.date.startsWith(currPrefix)) currSum += e.amount;
-      else if (e.date.startsWith(prevPrefix)) prevSum += e.amount;
-    }
-    if (prevSum === 0) return currSum > 0 ? { pct: 100, positive: true } : { pct: 0, positive: true };
-    const pct = ((currSum - prevSum) / Math.abs(prevSum)) * 100;
-    return { pct, positive: pct >= 0 };
-  }, [entries]);
-
   const adeudado = ahorrosMamaPapa - grandTotal;
 
   /** Saldo al cierre de cada mes (últimos 5 meses) para el gráfico. Por mes: total y por cuenta. */
@@ -1016,7 +996,7 @@ export function App() {
     return result;
   }, [entries, places]);
 
-  /** Variación del saldo al cierre: mes actual vs mes anterior (para el gráfico Saldo al cierre del mes) */
+  /** Variación del saldo acumulado: cierre mes actual vs mes anterior (Mis cuentas + gráfico) */
   const monthlyChartVsLastMonth = useMemo(() => {
     if (monthlyClosingBalances.length < 2) return null;
     const curr = monthlyClosingBalances[monthlyClosingBalances.length - 1].total;
@@ -4278,17 +4258,19 @@ export function App() {
               <h2 className="panel-title">Mis cuentas</h2>
               <div className="panel-total-row">
                 <div className="panel-total">{formatCurrency(grandTotal)}</div>
-                <div className={`panel-total-variation ${totalVsLastMonth.positive ? "panel-total-variation--up" : "panel-total-variation--down"}`}>
-                  <span className="panel-total-variation-pill">
-                    <span className="panel-total-variation-arrow" aria-hidden>
-                      {totalVsLastMonth.positive ? "↑" : "↓"}
+                {monthlyChartVsLastMonth != null && (
+                  <div className={`panel-total-variation ${monthlyChartVsLastMonth.positive ? "panel-total-variation--up" : "panel-total-variation--down"}`}>
+                    <span className="panel-total-variation-pill">
+                      <span className="panel-total-variation-arrow" aria-hidden>
+                        {monthlyChartVsLastMonth.positive ? "↑" : "↓"}
+                      </span>
+                      <span className="panel-total-variation-pct">
+                        {monthlyChartVsLastMonth.pct.toFixed(1)}%
+                      </span>
                     </span>
-                    <span className="panel-total-variation-pct">
-                      {totalVsLastMonth.pct.toFixed(1)}%
-                    </span>
-                  </span>
-                  <span className="panel-total-variation-label">vs último mes</span>
-                </div>
+                    <span className="panel-total-variation-label">vs último mes</span>
+                  </div>
+                )}
               </div>
               <p className="panel-sub">Saldo total en todas las fuentes</p>
               <ul className="accounts-list">
